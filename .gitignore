@@ -1,0 +1,11 @@
+*.fasl
+*.o
+.cache/
+/systems/
+*.core          # saved Lisp images (regenerated on demand)
+
+# OS / editor / Python junk
+.DS_Store
+__pycache__/
+*.pyc
+.claude/settings.local.json

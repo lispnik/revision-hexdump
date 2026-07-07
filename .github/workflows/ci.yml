@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out revision-hexdump
+        uses: actions/checkout@v4
+        with:
+          path: revision-hexdump
+
+      # setup.lisp expects the framework as a sibling.  revision has no external
+      # runtime dependencies; the test suite uses FiveAM, which revision pins in
+      # its systems.csv (fetched below with ocicl).
+      - name: Clone the sibling framework
+        run: git clone --depth 1 https://github.com/lispnik/revision.git revision
+
+      - name: Resolve sibling version
+        id: sib
+        run: echo "key=$(git -C revision rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install SBCL
+        run: sudo apt-get update && sudo apt-get install -y sbcl
+
+      # Cache the compiled fasls + the ocicl-fetched deps, keyed on the framework
+      # commit and its dependency pins.
+      - name: Cache Lisp fasls + deps
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/common-lisp
+            revision/systems
+          key: ${{ runner.os }}-${{ steps.sib.outputs.key }}-${{ hashFiles('revision/systems.csv') }}
+
+      - name: Install ocicl + fetch FiveAM
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          OCICL_VERSION: "2.16.14"
+        run: |
+          curl -fsSL -o /tmp/ocicl.tgz "https://github.com/ocicl/ocicl/releases/download/v${OCICL_VERSION}/ocicl-${OCICL_VERSION}-linux-amd64.tar.gz"
+          sudo tar -xzf /tmp/ocicl.tgz -C /usr/local/bin ./ocicl
+          ocicl setup > /dev/null 2>&1 || true
+          # revision pins FiveAM (+ alexandria / trivial-backtrace) in its
+          # systems.csv; install them into revision/systems so setup.lisp finds them.
+          (cd revision && ocicl install)
+
+      # On a cache hit the freshly-cloned sibling looks newer than its fasls, so
+      # ASDF would recompile; backdate it so the cache is trusted.
+      - name: Trust cached sibling fasls
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: find revision -type f -exec touch -t 200001010000 {} +
+
+      - name: Build + run the suite
+        run: make -C revision-hexdump test
