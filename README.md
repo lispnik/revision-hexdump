@@ -27,10 +27,13 @@ classic hex-editor default).
 | `Home` `End` | start / end of file |
 | `Tab` | switch the **hex ⇄ ASCII** edit pane |
 | `Insert` | toggle **overwrite ⇄ insert** mode |
+| `Shift`+move | extend the byte **selection** |
+| `Ctrl+C` `Ctrl+X` `Ctrl+V` | copy / cut / paste the selection |
 | `0`–`9` `a`–`f` | edit the byte's high then low nibble (hex pane) |
 | *(printable)* | edit the byte (ASCII pane) |
 | `Bksp` `Del` | delete a byte (insert mode) |
 | `Ctrl+F` | find — hex bytes (`deadbeef`) or `/text`; empty repeats (find-next) |
+| `Ctrl+R` | replace all — find + replacement (hex or `/text`; empty replacement deletes) |
 | `Ctrl+G` | go to a hex offset (`1F` or `0x1F`) |
 | `Ctrl+E` | toggle the data inspector's byte order (LE / BE) |
 | `Ctrl+Z` `Ctrl+Y` | undo / redo |
@@ -47,6 +50,12 @@ the cursor. **Insert** mode (toggle with `Insert`) lets typing *insert* new byte
 `Bksp`/`Del` *remove* them, so you can change the file's length or fill an empty file.
 Undo/redo (`Ctrl+Z`/`Ctrl+Y`) covers overwrite, insert, and delete alike, and the frame
 indicator shows the pane and mode (`hex ins 0x1F/0x2C *`).
+
+**Shift**+movement extends a byte **selection** (highlighted); `Ctrl+C`/`Ctrl+X`/`Ctrl+V`
+copy / cut / paste it through a shared byte clipboard (paste inserts in insert mode,
+overwrites in overwrite mode). `Ctrl+R` **replaces** all occurrences of a pattern (an empty
+replacement deletes them). Multi-byte operations — paste, cut, replace-all — are a single
+undo step.
 
 A **data inspector** under the dump decodes the bytes at the cursor as `u8`/`i8` …
 `u64`/`i64` and `f32`/`f64`, in little- or big-endian (`Ctrl+E` toggles). The dump

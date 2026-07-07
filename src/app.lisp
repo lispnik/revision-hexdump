@@ -27,10 +27,13 @@ Tab toggles the hex/ASCII pane, and it reports unsaved edits so the desktop guar
 (defun %hx-status (w)
   (let ((v (%hx-view w)) (s (find-view w 'status)))
     (when (and v s)
-      (setf (static-text-text s)
-            (or (and (hexv-message v) (format nil " ~A " (hexv-message v)))   ; transient note takes priority
-                (format nil " ~:[HEX~;ASCII~]/~:[OVR~;INS~] · 0x~X of 0x~X · Tab: pane · Ins: mode · Ctrl-F: find · Ctrl-G: goto · Ctrl-Z: undo · Ctrl-S: save "
-                        (eq (hexv-pane v) :ascii) (eq (hexv-mode v) :insert) (hexv-cursor v) (hexv-length v)))))))
+      (let ((sel (hexv-selection v)))
+        (setf (static-text-text s)
+              (or (and (hexv-message v) (format nil " ~A " (hexv-message v)))   ; transient note takes priority
+                  (and sel (format nil " ~D bytes selected · Ctrl-C: copy · Ctrl-X: cut · Ctrl-V: paste · Esc: close "
+                                   (1+ (- (cdr sel) (car sel)))))
+                  (format nil " ~:[HEX~;ASCII~]/~:[OVR~;INS~] · 0x~X of 0x~X · Ins: mode · Ctrl-F: find · Ctrl-R: replace · Ctrl-G: goto · Ctrl-Z: undo · Ctrl-S: save "
+                          (eq (hexv-pane v) :ascii) (eq (hexv-mode v) :insert) (hexv-cursor v) (hexv-length v))))))))
 
 (defun %hx-inspect (w)
   "Refresh the two data-inspector lines from the cursor."

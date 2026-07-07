@@ -73,6 +73,8 @@
              :documentation "Bytes shown per row; LAYOUT sizes it to the view width (a multiple of 8).")
    (big-endian :initform nil :accessor hexv-big-endian  ; data-inspector byte order (NIL = little-endian)
              :documentation "Byte order the data inspector decodes with (NIL little-endian; Ctrl-E toggles).")
+   (anchor   :initform nil :accessor hexv-anchor         ; selection anchor offset (NIL = no selection)
+             :documentation "The offset where a Shift-extended selection began, or NIL when nothing is selected.")
    (last-search :initform nil :accessor hexv-last-search)  ; the last search pattern (byte vector), for find-next
    (changed  :initform (make-hash-table) :accessor hexv-changed)  ; offset -> T, touched since load/save (highlight)
    (history  :initform (make-array 0 :adjustable t :fill-pointer 0) :accessor hexv-history
@@ -193,13 +195,36 @@ clean checkpoint lived in the dropped tail, mark it unreachable."
   (ecase (first edit)
     (:set (setf (aref (hexv-bytes v) (second edit)) (fourth edit)))
     (:ins (%buf-insert v (second edit) (third edit)))
-    (:del (%buf-delete v (second edit)))))
+    (:del (%buf-delete v (second edit)))
+    (:group (dolist (sub (rest edit)) (%apply-forward v sub)))))
 
 (defun %apply-reverse (v edit)
   (ecase (first edit)
     (:set (setf (aref (hexv-bytes v) (second edit)) (third edit)))
     (:ins (%buf-delete v (second edit)))
-    (:del (%buf-insert v (second edit) (third edit)))))
+    (:del (%buf-insert v (second edit) (third edit)))
+    (:group (dolist (sub (reverse (rest edit))) (%apply-reverse v sub)))))
+
+(defun %edit-offset (edit)
+  "A representative byte offset for EDIT (for revealing the cursor after undo/redo)."
+  (if (eq (first edit) :group) (%edit-offset (second edit)) (second edit)))
+
+(defun %coalesce (v start)
+  "Replace the history entries added since START (an HPOS) with a single (:group ...) step,
+so a multi-byte operation (paste, cut, replace) is one undo/redo."
+  (let ((end (hexv-hpos v)))
+    (when (> (- end start) 1)
+      (let ((subs (loop for i from start below end collect (aref (hexv-history v) i))))
+        (setf (fill-pointer (hexv-history v)) start)
+        (vector-push-extend (cons :group subs) (hexv-history v))
+        (setf (hexv-hpos v) (1+ start))))))
+
+(defmacro %as-one-edit ((v) &body body)
+  "Coalesce every edit BODY records on V into a single undo/redo step."
+  (let ((vv (gensym "V")) (start (gensym "START")))
+    `(let* ((,vv ,v) (,start (hexv-hpos ,vv)))
+       (multiple-value-prog1 (progn ,@body)
+         (%coalesce ,vv ,start)))))
 
 (defun %after-edit (v &optional structural)
   "Shared bookkeeping after an edit: a STRUCTURAL (insert/delete) edit shifts offsets, so
@@ -236,7 +261,7 @@ drop the offset-keyed change highlights; run the on-change hook; repaint."
       (let ((edit (aref (hexv-history v) (decf (hexv-hpos v)))))
         (%apply-reverse v edit)
         (%after-edit v t)                                ; offsets may have shifted -> reset highlights
-        (%goto v (second edit))
+        (%goto v (%edit-offset edit))
         t)
       (progn (setf (hexv-message v) "nothing to undo") (invalidate v) nil)))
 
@@ -247,7 +272,7 @@ drop the offset-keyed change highlights; run the on-change hook; repaint."
         (incf (hexv-hpos v))
         (%apply-forward v edit)
         (%after-edit v t)
-        (%goto v (second edit))
+        (%goto v (%edit-offset edit))
         t)
       (progn (setf (hexv-message v) "nothing to redo") (invalidate v) nil)))
 
@@ -414,6 +439,94 @@ buffer end shows as \"—\"."
   (setf (hexv-big-endian v) (not (hexv-big-endian v)))
   (invalidate v))
 
+;;; --- selection + clipboard --------------------------------------------------
+
+(defvar *clipboard* (make-array 0 :element-type '(unsigned-byte 8))
+  "Shared byte clipboard for hex-view copy / cut / paste.")
+
+(defun hexv-selection (v)
+  "The inclusive (LO . HI) selected byte range, or NIL when nothing is selected."
+  (let ((a (hexv-anchor v)))
+    (when a (cons (min a (hexv-cursor v)) (max a (hexv-cursor v))))))
+
+(defun %sel-anchor (v shift)
+  "Before a move: extend the selection when SHIFT is held (setting the anchor on the first
+extend), or collapse it otherwise."
+  (if shift
+      (unless (hexv-anchor v) (setf (hexv-anchor v) (hexv-cursor v)))
+      (setf (hexv-anchor v) nil)))
+
+(defun hex-copy (v)
+  "Copy the selected bytes to the shared clipboard."
+  (let ((sel (hexv-selection v)))
+    (when sel
+      (setf *clipboard* (subseq (hexv-bytes v) (car sel) (1+ (cdr sel)))
+            (hexv-message v) (format nil "copied ~D byte~:P" (length *clipboard*)))
+      (invalidate v))))
+
+(defun hex-cut (v)
+  "Copy the selection to the clipboard and delete it (one undo step)."
+  (let ((sel (hexv-selection v)))
+    (when sel
+      (setf *clipboard* (subseq (hexv-bytes v) (car sel) (1+ (cdr sel))))
+      (%as-one-edit (v) (loop repeat (1+ (- (cdr sel) (car sel))) do (%delete-byte v (car sel))))
+      (setf (hexv-anchor v) nil (hexv-message v) (format nil "cut ~D byte~:P" (length *clipboard*)))
+      (%goto v (car sel))
+      (invalidate v))))
+
+(defun hex-paste (v)
+  "Paste the clipboard at the cursor: insert (insert mode) or overwrite up to the buffer
+end (overwrite mode).  One undo step."
+  (when (plusp (length *clipboard*))
+    (let ((clip *clipboard*) (off (hexv-cursor v)))
+      (if (eq (hexv-mode v) :insert)
+          (%as-one-edit (v) (dotimes (k (length clip)) (%insert-byte v (+ off k) (aref clip k))))
+          (%as-one-edit (v) (dotimes (k (length clip))
+                              (when (< (+ off k) (hexv-length v))
+                                (%set-byte v (+ off k) (aref clip k))))))
+      (setf (hexv-anchor v) nil (hexv-message v) (format nil "pasted ~D byte~:P" (length clip)))
+      (invalidate v))))
+
+;;; --- find + replace ---------------------------------------------------------
+
+(defun %replace-range (v off m replacement)
+  "Replace the M bytes at OFF with the sequence REPLACEMENT (overwrite the overlap, then
+insert extra / delete surplus)."
+  (let ((r (length replacement)))
+    (dotimes (k (min m r)) (%set-byte v (+ off k) (elt replacement k)))
+    (cond ((> r m) (loop for k from m below r do (%insert-byte v (+ off k) (elt replacement k))))
+          ((< r m) (loop repeat (- m r) do (%delete-byte v (+ off r)))))))
+
+(defun hex-replace-all (v pattern replacement)
+  "Replace every occurrence of PATTERN with REPLACEMENT; returns the count.  One undo step."
+  (%as-one-edit (v)
+    (let ((count 0) (m (length pattern)) (r (length replacement)))
+      (loop with off = 0
+            for hit = (%find-bytes (hexv-bytes v) pattern off)
+            while hit
+            do (%replace-range v hit m replacement) (incf count) (setf off (+ hit r))
+            finally (return count)))))
+
+(defun hex-prompt-replace (v)
+  "Prompt for a search pattern and a replacement, replace all occurrences, and report the
+count.  An empty replacement deletes the matches."
+  (let ((s (prompt-string " Replace " "Find (hex bytes or /text):")))
+    (when (and s (plusp (length (string-trim " " s))))
+      (let ((pat (%parse-search s)))
+        (if (null pat)
+            (setf (hexv-message v) "invalid search pattern")
+            (let ((rs (prompt-string " Replace " "With (hex, /text, or empty to delete):")))
+              (when rs
+                (let ((rep (if (zerop (length (string-trim " " rs)))
+                               (make-array 0 :element-type '(unsigned-byte 8))
+                               (%parse-search rs))))
+                  (if (null rep)
+                      (setf (hexv-message v) "invalid replacement")
+                      (let ((n (hex-replace-all v pat rep)))
+                        (setf (hexv-anchor v) nil
+                              (hexv-message v) (format nil "replaced ~D occurrence~:P" n))))))))))
+    (invalidate v)))
+
 ;;; --- the scroll protocol (a hosting window draws the frame scrollbar) --------
 
 (defmethod scroll-page ((v hex-view)) (%page v))
@@ -430,19 +543,20 @@ buffer end shows as \"—\"."
 
 ;;; --- drawing ----------------------------------------------------------------
 
-(defun %cell-attr (v off cur-pane)
-  "Colour for byte OFF in the pane CUR-PANE: the cursor cell in the active pane is
-highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
+(defun %cell-attr (v off cur-pane sel)
+  "Colour for byte OFF in the pane CUR-PANE: the cursor cell in the active pane, a selected
+byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
   (let ((cur (= off (hexv-cursor v))))
     (cond ((and cur (eq (hexv-pane v) cur-pane)) (role :focused))
           (cur                                   (role :input-focused))
+          ((and sel (<= (car sel) off (cdr sel))) (role :menu-selected))  ; selection
           ((and (hexv-modified v) (gethash off (hexv-changed v))) (role :error))  ; flagged only while dirty
           (t                                     (role :normal)))))
 
 (defmethod draw ((v hex-view))
   (let* ((b (view-bounds v)) (w (rect-width b)) (h (rect-height b))
          (ax (rect-ax b)) (ay (rect-ay b)) (bpr (hexv-bpr v))
-         (n (hexv-length v)) (top (hexv-top v)))
+         (n (hexv-length v)) (top (hexv-top v)) (sel (hexv-selection v)))
     (dotimes (r h)
       (fill-row v 0 r w (role :normal))
       (let ((base (* (+ top r) bpr)))
@@ -452,10 +566,10 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
             (let ((off (+ base i)))
               (when (< off n)
                 (let ((byte (aref (hexv-bytes v) off)))
-                  (draw-text v (%hex-col i) r (format nil "~2,'0X" byte) (%cell-attr v off :hex))
+                  (draw-text v (%hex-col i) r (format nil "~2,'0X" byte) (%cell-attr v off :hex sel))
                   (draw-text v (%ascii-col bpr i) r
                              (string (if (<= 32 byte 126) (code-char byte) #\.))
-                             (%cell-attr v off :ascii)))))))))
+                             (%cell-attr v off :ascii sel)))))))))
     ;; a real block cursor in the active pane (only when focused); in insert mode it can
     ;; sit at the append position (offset = length), including an empty buffer.
     (when (and (view-focused-p v) *screen* (or (plusp n) (eq (hexv-mode v) :insert)))
@@ -488,23 +602,27 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
     (invalidate v)))
 
 (defmethod handle-event ((v hex-view) (e key-event))
-  (let ((ks (event-keysym e)) (mods (event-modifiers e)))
+  (let* ((ks (event-keysym e)) (mods (event-modifiers e)) (shift (logtest mods +md-shift+)))
     (cond
-      ((eql ks :left)  (%move v -1)                     (setf (handled-p e) t))
-      ((eql ks :right) (%move v 1)                      (setf (handled-p e) t))
-      ((eql ks :up)    (%move v (- (hexv-bpr v)))       (setf (handled-p e) t))
-      ((eql ks :down)  (%move v (hexv-bpr v))           (setf (handled-p e) t))
-      ((eql ks :pgup)  (%move v (- (* (hexv-bpr v) (%page v)))) (setf (handled-p e) t))
-      ((eql ks :pgdn)  (%move v (* (hexv-bpr v) (%page v))) (setf (handled-p e) t))
-      ((eql ks :home)  (%goto v 0)                      (setf (handled-p e) t))
-      ((eql ks :end)   (%goto v (%max-cursor v))        (setf (handled-p e) t))
+      ((eql ks :left)  (%sel-anchor v shift) (%move v -1) (setf (handled-p e) t))
+      ((eql ks :right) (%sel-anchor v shift) (%move v 1)  (setf (handled-p e) t))
+      ((eql ks :up)    (%sel-anchor v shift) (%move v (- (hexv-bpr v))) (setf (handled-p e) t))
+      ((eql ks :down)  (%sel-anchor v shift) (%move v (hexv-bpr v))     (setf (handled-p e) t))
+      ((eql ks :pgup)  (%sel-anchor v shift) (%move v (- (* (hexv-bpr v) (%page v)))) (setf (handled-p e) t))
+      ((eql ks :pgdn)  (%sel-anchor v shift) (%move v (* (hexv-bpr v) (%page v)))     (setf (handled-p e) t))
+      ((eql ks :home)  (%sel-anchor v shift) (%goto v 0)                (setf (handled-p e) t))
+      ((eql ks :end)   (%sel-anchor v shift) (%goto v (%max-cursor v))  (setf (handled-p e) t))
       ((eql ks :ins)   (hex-toggle-mode v)              (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\s) (%hx-save-report v)   (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\z) (hex-undo v)          (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\y) (hex-redo v)          (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\g) (hex-prompt-goto v)   (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\f) (hex-prompt-find v)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\r) (hex-prompt-replace v) (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\e) (hex-toggle-endian v) (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\c) (hex-copy v)          (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\x) (hex-cut v)           (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\v) (hex-paste v)         (setf (handled-p e) t))
       ;; insert mode: Del removes the byte under the cursor, Bksp the one before it
       ((and (eq (hexv-mode v) :insert) (eql ks :del))
        (%delete-byte v (hexv-cursor v))                 (setf (handled-p e) t))
@@ -523,7 +641,8 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
   (let ((base (* (+ (hexv-top v) (mouse-row v e)) (hexv-bpr v))))
     (multiple-value-bind (pane i) (%col->byte (hexv-bpr v) (mouse-col v e))
       (when (and pane (< (+ base i) (hexv-length v)))
-        (setf (hexv-pane v) pane (hexv-cursor v) (+ base i) (hexv-nibble v) 0)
+        (setf (hexv-pane v) pane (hexv-cursor v) (+ base i) (hexv-nibble v) 0
+              (hexv-anchor v) nil)                       ; a click collapses any selection
         (invalidate v))))
   (setf (handled-p e) t))
 
@@ -536,6 +655,7 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
   (declare (ignore v))
   '(("Left / Right" . "move one byte")
     ("Up / Down"    . "move one row")
+    ("Shift+move"   . "extend the byte selection")
     ("PgUp / PgDn"  . "page up / down")
     ("Home / End"   . "start / end of file")
     ("Tab"          . "switch the hex / ASCII pane")
@@ -543,7 +663,9 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
     ("0-9 a-f"      . "edit the byte's nibbles (hex pane)")
     ("(printable)"  . "edit the byte (ASCII pane)")
     ("Bksp / Del"   . "delete a byte (insert mode)")
+    ("Ctrl+C / Ctrl+X / Ctrl+V" . "copy / cut / paste the selection")
     ("Ctrl+F"       . "find hex bytes or /text (empty = find next)")
+    ("Ctrl+R"       . "replace all (hex or /text)")
     ("Ctrl+G"       . "go to a hex offset")
     ("Ctrl+E"       . "toggle the data inspector's byte order (LE/BE)")
     ("Ctrl+Z / Ctrl+Y" . "undo / redo")

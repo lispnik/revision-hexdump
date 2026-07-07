@@ -296,6 +296,65 @@
     (fiveam:is (= 0 (hex-search v (%parse-search "/the"))) "wraps around to the first match")
     (fiveam:is-false (hex-search v (%parse-search "/zzz") 0) "reports no match")))
 
+;;; --- selection + clipboard --------------------------------------------------
+
+(fiveam:test selection-range
+  (let ((v (%view (%range 10))))
+    (fiveam:is-false (hexv-selection v) "no selection by default")
+    (%sel-anchor v t) (%move v 3)                       ; Shift-move from 0 to 3
+    (fiveam:is (equal '(0 . 3) (hexv-selection v)) "shift-move sets an inclusive range")
+    (%sel-anchor v nil)                                 ; a plain move collapses it
+    (fiveam:is-false (hexv-selection v))))
+
+(fiveam:test copy-paste-overwrite
+  (let ((v (%view #(#x11 #x22 #x33 #x44 #x55))))
+    (%sel-anchor v t) (%move v 1)                       ; select bytes 0..1 (11 22)
+    (hex-copy v)
+    (fiveam:is (equalp #(#x11 #x22) (coerce *clipboard* 'vector)) "copy grabs the selection")
+    (%goto v 3)                                         ; overwrite mode: paste over bytes 3..4
+    (hex-paste v)
+    (fiveam:is (equalp #(#x11 #x22 #x33 #x11 #x22) (coerce (hexv-bytes v) 'vector))
+               "overwrite paste replaces in place, keeping the size")))
+
+(fiveam:test cut-and-paste-insert
+  (let ((v (%view #(#xAA #xBB #xCC #xDD))))
+    (setf (hexv-mode v) :insert)
+    (%goto v 1) (%sel-anchor v t) (%move v 1)           ; select bytes 1..2 (BB CC)
+    (hex-cut v)
+    (fiveam:is (equalp #(#xAA #xDD) (coerce (hexv-bytes v) 'vector)) "cut removes the selection")
+    (fiveam:is (equalp #(#xBB #xCC) (coerce *clipboard* 'vector)) "and keeps it on the clipboard")
+    (%goto v 2) (hex-paste v)                           ; insert-paste at the end
+    (fiveam:is (equalp #(#xAA #xDD #xBB #xCC) (coerce (hexv-bytes v) 'vector)) "insert paste grows the buffer")))
+
+(fiveam:test cut-paste-is-one-undo
+  (let ((v (%view #(1 2 3 4 5))))
+    (setf (hexv-mode v) :insert)
+    (%goto v 1) (%sel-anchor v t) (%move v 2)           ; select 3 bytes (1..3)
+    (hex-cut v)                                         ; delete 3 bytes -> one undo step
+    (fiveam:is (= 2 (hexv-length v)))
+    (hex-undo v)
+    (fiveam:is (equalp #(1 2 3 4 5) (coerce (hexv-bytes v) 'vector)) "one undo restores the whole cut")
+    (fiveam:is-false (hexv-modified v) "and returns to the clean checkpoint")))
+
+;;; --- replace ----------------------------------------------------------------
+
+(fiveam:test replace-same-length
+  (let ((v (%view (map 'list #'char-code "a-b-c-d"))))
+    (fiveam:is (= 3 (hex-replace-all v (%parse-search "/-") (%parse-search "/+"))) "replaces all, returns the count")
+    (fiveam:is (string= "a+b+c+d" (map 'string #'code-char (hexv-bytes v))))))
+
+(fiveam:test replace-different-length-and-undo
+  (let ((v (%view (map 'list #'char-code "xAAx"))))
+    (hex-replace-all v (%parse-search "/AA") (%parse-search "/BBB"))   ; grow: 2 -> 3 bytes
+    (fiveam:is (string= "xBBBx" (map 'string #'code-char (hexv-bytes v))) "replacement may change length")
+    (hex-undo v)
+    (fiveam:is (string= "xAAx" (map 'string #'code-char (hexv-bytes v))) "one undo reverts the whole replace-all")))
+
+(fiveam:test replace-delete
+  (let ((v (%view (map 'list #'char-code "a,b,c"))))
+    (hex-replace-all v (%parse-search "/,") (make-array 0 :element-type '(unsigned-byte 8)))  ; empty = delete
+    (fiveam:is (string= "abc" (map 'string #'code-char (hexv-bytes v))) "an empty replacement deletes the matches")))
+
 ;;; --- data inspector ---------------------------------------------------------
 
 (fiveam:test data-inspector
