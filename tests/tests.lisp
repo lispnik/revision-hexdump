@@ -227,6 +227,67 @@
       (fiveam:is-true err "a failed save returns the error rather than signalling")
       (fiveam:is-true (hexv-modified v) "a failed save leaves the buffer modified"))))
 
+;;; --- insert / delete mode ---------------------------------------------------
+
+(fiveam:test insert-grows-buffer
+  (let ((v (%view #(#xAA #xBB))))
+    (setf (hexv-mode v) :insert (hexv-cursor v) 1)
+    (%insert-byte v 1 #xCC)                             ; insert between AA and BB
+    (fiveam:is (= 3 (hexv-length v)) "insert grows the buffer")
+    (fiveam:is (equalp #(#xAA #xCC #xBB) (coerce (hexv-bytes v) 'vector)))))
+
+(fiveam:test insert-into-empty
+  (let ((v (%view #())))
+    (setf (hexv-mode v) :insert)
+    (%ascii-input v #\H) (%ascii-input v #\i)           ; type into an empty buffer
+    (fiveam:is (= 2 (hexv-length v)) "insert mode can edit an empty file")
+    (fiveam:is (string= "Hi" (map 'string #'code-char (hexv-bytes v))))
+    (fiveam:is (= 2 (hexv-cursor v)) "cursor sits at the append position")))
+
+(fiveam:test delete-shrinks-buffer
+  (let ((v (%view #(#x11 #x22 #x33))))
+    (setf (hexv-mode v) :insert (hexv-cursor v) 1)
+    (%delete-byte v 1)                                  ; remove 0x22
+    (fiveam:is (= 2 (hexv-length v)))
+    (fiveam:is (equalp #(#x11 #x33) (coerce (hexv-bytes v) 'vector)))))
+
+(fiveam:test insert-delete-undo
+  (let ((v (%view #(#x11 #x22))))
+    (setf (hexv-mode v) :insert (hexv-cursor v) 1)
+    (%insert-byte v 1 #x99)                             ; #(11 99 22)
+    (%delete-byte v 0)                                  ; #(99 22)
+    (fiveam:is (equalp #(#x99 #x22) (coerce (hexv-bytes v) 'vector)))
+    (hex-undo v)                                        ; undo delete -> #(11 99 22)
+    (fiveam:is (equalp #(#x11 #x99 #x22) (coerce (hexv-bytes v) 'vector)) "undo restores a deleted byte")
+    (hex-undo v)                                        ; undo insert -> #(11 22)
+    (fiveam:is (equalp #(#x11 #x22) (coerce (hexv-bytes v) 'vector)) "undo removes an inserted byte")
+    (fiveam:is-false (hexv-modified v) "back at the load checkpoint")
+    (hex-redo v) (hex-redo v)                           ; redo both
+    (fiveam:is (equalp #(#x99 #x22) (coerce (hexv-bytes v) 'vector)) "redo reapplies insert then delete")))
+
+(fiveam:test mode-toggle-clamps-cursor
+  (let ((v (%view #(1 2 3))))
+    (setf (hexv-mode v) :insert (hexv-cursor v) 3)      ; the append position
+    (hex-toggle-mode v)                                 ; back to overwrite
+    (fiveam:is (eq :overwrite (hexv-mode v)))
+    (fiveam:is (= 2 (hexv-cursor v)) "leaving insert mode clamps the append cursor onto a byte")))
+
+;;; --- search -----------------------------------------------------------------
+
+(fiveam:test parse-search
+  (fiveam:is (equalp #(#xDE #xAD #xBE #xEF) (%parse-search "deadbeef")))
+  (fiveam:is (equalp #(#xDE #xAD) (%parse-search "de ad")))
+  (fiveam:is (equalp #(72 105) (%parse-search "/Hi")) "a leading / means literal ASCII")
+  (fiveam:is-false (%parse-search "xyz") "non-hex is rejected")
+  (fiveam:is-false (%parse-search "abc") "an odd number of hex digits is rejected"))
+
+(fiveam:test search
+  (let ((v (%view (map 'list #'char-code "the fox and the dog"))))
+    (fiveam:is (= 4 (hex-search v (%parse-search "/fox") 0)) "finds a literal string")
+    (fiveam:is (= 12 (hex-search v (%parse-search "/the"))) "find-next continues past the cursor")
+    (fiveam:is (= 0 (hex-search v (%parse-search "/the"))) "wraps around to the first match")
+    (fiveam:is-false (hex-search v (%parse-search "/zzz") 0) "reports no match")))
+
 ;;; --- go-to-offset parsing ---------------------------------------------------
 
 (fiveam:test parse-offset

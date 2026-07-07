@@ -62,9 +62,12 @@
              :documentation "Which nibble of the current byte the hex pane will edit next (0 hi, 1 lo).")
    (pane     :initform :hex :accessor hexv-pane        ; :hex | :ascii
              :documentation "The active edit pane, :HEX or :ASCII (Tab toggles).")
+   (mode     :initform :overwrite :accessor hexv-mode   ; :overwrite | :insert (Ins toggles)
+             :documentation "Editing mode: :OVERWRITE keeps the file size; :INSERT lets typing insert bytes and Bksp/Del remove them.")
+   (last-search :initform nil :accessor hexv-last-search)  ; the last search pattern (byte vector), for find-next
    (changed  :initform (make-hash-table) :accessor hexv-changed)  ; offset -> T, touched since load/save (highlight)
    (history  :initform (make-array 0 :adjustable t :fill-pointer 0) :accessor hexv-history
-             :documentation "The edit log: a vector of (OFFSET OLD NEW) records for undo/redo.")
+             :documentation "The edit log: a vector of tagged records ((:SET off old new) / (:INS off val) / (:DEL off val)) for undo/redo.")
    (hpos     :initform 0 :accessor hexv-hpos            ; how many history edits are currently applied
              :documentation "Number of HISTORY edits applied to the buffer (the undo/redo position).")
    (saved-pos :initform 0 :accessor hexv-saved-pos      ; HPOS at the last load/save; -1 = clean state discarded
@@ -83,7 +86,13 @@ it answers the scroll protocol so a hosting window draws a frame scrollbar."))
 
 (defun hexv-length (v) (length (hexv-bytes v)))
 (defun %page (v) (max 1 (rect-height (view-bounds v))))
-(defun %rows (v) (max 1 (ceiling (max 1 (hexv-length v)) +bpr+)))
+;; +1 so a cursor at the append position (offset = length, valid in insert mode) has a row.
+(defun %rows (v) (max 1 (ceiling (1+ (hexv-length v)) +bpr+)))
+(defun %max-cursor (v)
+  "The greatest valid cursor offset: LENGTH in insert mode (the append position), else
+LENGTH-1 (overwrite addresses an existing byte)."
+  (let ((n (hexv-length v)))
+    (if (eq (hexv-mode v) :insert) n (max 0 (1- n)))))
 
 (defun hexv-modified (v)
   "Does V differ from the last saved/loaded state?  True iff the applied-edit position
@@ -127,53 +136,111 @@ when there is no path.  It never signals -- a failed save must not crash the hos
           ((>= row (+ (hexv-top v) page)) (setf (hexv-top v) (1+ (- row page)))))))
 
 (defun %goto (v off)
-  "Move the cursor to byte OFF (clamped), reset the nibble, clear any transient note,
-and reveal it."
+  "Move the cursor to byte OFF (clamped to the valid range), reset the nibble, clear any
+transient note, and reveal it."
   (setf (hexv-message v) nil)
-  (let ((n (hexv-length v)))
-    (when (plusp n)
-      (setf (hexv-cursor v) (max 0 (min off (1- n)))
-            (hexv-nibble v) 0)
-      (%ensure-visible v))))
+  (when (or (plusp (hexv-length v)) (eq (hexv-mode v) :insert))
+    (setf (hexv-cursor v) (max 0 (min off (%max-cursor v)))
+          (hexv-nibble v) 0)
+    (%ensure-visible v)))
 
 (defun %move (v delta) (%goto v (+ (hexv-cursor v) delta)))
 
-;;; --- editing (overwrite; preserves the buffer size) -------------------------
+;;; --- editing --------------------------------------------------------------
+;;; The buffer is a fill-pointered vector, so overwrite is an AREF, insert shifts
+;;; the tail right and grows it, delete shifts left and shrinks it.  Every edit is
+;;; logged as a tagged record so undo/redo can replay it in either direction.
+
+(defun %buf-insert (v off value)
+  "Insert VALUE (an octet) into V's buffer at OFF, shifting the tail right."
+  (let ((buf (hexv-bytes v)))
+    (vector-push-extend 0 buf)
+    (loop for i from (1- (fill-pointer buf)) above off do (setf (aref buf i) (aref buf (1- i))))
+    (setf (aref buf off) (logand value #xff))))
+
+(defun %buf-delete (v off)
+  "Delete the byte at OFF from V's buffer, shifting the tail left."
+  (let ((buf (hexv-bytes v)))
+    (loop for i from off below (1- (fill-pointer buf)) do (setf (aref buf i) (aref buf (1+ i))))
+    (decf (fill-pointer buf))))
+
+(defun %push-edit (v edit)
+  "Log EDIT at the current position: drop any redo tail, append, advance HPOS.  If the
+clean checkpoint lived in the dropped tail, mark it unreachable."
+  (setf (fill-pointer (hexv-history v)) (hexv-hpos v))
+  (when (> (hexv-saved-pos v) (hexv-hpos v)) (setf (hexv-saved-pos v) -1))
+  (vector-push-extend edit (hexv-history v))
+  (incf (hexv-hpos v)))
+
+(defun %apply-forward (v edit)
+  (ecase (first edit)
+    (:set (setf (aref (hexv-bytes v) (second edit)) (fourth edit)))
+    (:ins (%buf-insert v (second edit) (third edit)))
+    (:del (%buf-delete v (second edit)))))
+
+(defun %apply-reverse (v edit)
+  (ecase (first edit)
+    (:set (setf (aref (hexv-bytes v) (second edit)) (third edit)))
+    (:ins (%buf-delete v (second edit)))
+    (:del (%buf-insert v (second edit) (third edit)))))
+
+(defun %after-edit (v &optional structural)
+  "Shared bookkeeping after an edit: a STRUCTURAL (insert/delete) edit shifts offsets, so
+drop the offset-keyed change highlights; run the on-change hook; repaint."
+  (when structural (clrhash (hexv-changed v)))
+  (when (hexv-on-change v) (funcall (hexv-on-change v) v))
+  (invalidate v))
 
 (defun %set-byte (v off value)
-  "Overwrite byte OFF with VALUE (0-255), logging an undo step.  A no-op write (the byte
-already holds VALUE) does nothing.  A fresh edit discards any redo tail."
+  "Overwrite byte OFF with VALUE (0-255), logging an undo step.  A no-op write does nothing."
   (let ((old (aref (hexv-bytes v) off)) (new (logand value #xff)))
     (unless (= old new)
-      (setf (fill-pointer (hexv-history v)) (hexv-hpos v))          ; drop the redo tail
-      (when (> (hexv-saved-pos v) (hexv-hpos v))                    ; the saved state was in that tail
-        (setf (hexv-saved-pos v) -1))                              ; -> now unreachable (stays modified)
-      (vector-push-extend (list off old new) (hexv-history v))
-      (incf (hexv-hpos v))
-      (setf (aref (hexv-bytes v) off) new
-            (gethash off (hexv-changed v)) t)
-      (when (hexv-on-change v) (funcall (hexv-on-change v) v))
-      (invalidate v))))
+      (%push-edit v (list :set off old new))
+      (setf (aref (hexv-bytes v) off) new (gethash off (hexv-changed v)) t)
+      (%after-edit v))))
+
+(defun %insert-byte (v off value)
+  "Insert VALUE at OFF (insert mode), logging an undo step."
+  (%push-edit v (list :ins off (logand value #xff)))
+  (%buf-insert v off value)
+  (%after-edit v t))
+
+(defun %delete-byte (v off)
+  "Delete the byte at OFF (if any), logging an undo step, and keep the cursor in range."
+  (when (< off (hexv-length v))
+    (%push-edit v (list :del off (aref (hexv-bytes v) off)))
+    (%buf-delete v off)
+    (setf (hexv-cursor v) (min (hexv-cursor v) (%max-cursor v)))
+    (%after-edit v t)))
 
 (defun hex-undo (v)
   "Undo the most recent edit; returns T when one was undone."
   (if (plusp (hexv-hpos v))
-      (destructuring-bind (off old new) (aref (hexv-history v) (decf (hexv-hpos v)))
-        (declare (ignore new))
-        (setf (aref (hexv-bytes v) off) old)
-        (%goto v off) (invalidate v) t)
+      (let ((edit (aref (hexv-history v) (decf (hexv-hpos v)))))
+        (%apply-reverse v edit)
+        (%after-edit v t)                                ; offsets may have shifted -> reset highlights
+        (%goto v (second edit))
+        t)
       (progn (setf (hexv-message v) "nothing to undo") (invalidate v) nil)))
 
 (defun hex-redo (v)
   "Reapply the next undone edit; returns T when one was redone."
   (if (< (hexv-hpos v) (fill-pointer (hexv-history v)))
-      (destructuring-bind (off old new) (aref (hexv-history v) (hexv-hpos v))
-        (declare (ignore old))
+      (let ((edit (aref (hexv-history v) (hexv-hpos v))))
         (incf (hexv-hpos v))
-        (setf (aref (hexv-bytes v) off) new
-              (gethash off (hexv-changed v)) t)
-        (%goto v off) (invalidate v) t)
+        (%apply-forward v edit)
+        (%after-edit v t)
+        (%goto v (second edit))
+        t)
       (progn (setf (hexv-message v) "nothing to redo") (invalidate v) nil)))
+
+(defun hex-toggle-mode (v)
+  "Toggle between overwrite and insert editing modes."
+  (setf (hexv-mode v) (if (eq (hexv-mode v) :insert) :overwrite :insert)
+        (hexv-nibble v) 0)
+  ;; leaving insert mode, drop the append position back onto a real byte
+  (setf (hexv-cursor v) (min (hexv-cursor v) (%max-cursor v)))
+  (invalidate v))
 
 (defun %parse-offset (s)
   "Parse a hex offset string (an optional 0x prefix, else plain hex), or NIL."
@@ -192,21 +259,78 @@ already holds VALUE) does nothing.  A fresh edit discards any redo tail."
     (invalidate v)))
 
 (defun %hex-input (v digit)
-  "Apply hex DIGIT (0-15) to the current byte's active nibble; the low nibble
-finishes the byte and advances the cursor."
-  (when (plusp (hexv-length v))
-    (let* ((off (hexv-cursor v)) (b (aref (hexv-bytes v) off)))
+  "Apply hex DIGIT (0-15) to the byte under the cursor.  Overwrite mode edits the current
+byte's active nibble; insert mode's first nibble inserts a new byte (DIGIT as its high
+nibble), the second finishes it.  Either way the low nibble advances the cursor."
+  (if (eq (hexv-mode v) :insert)
       (if (zerop (hexv-nibble v))
-          (progn (%set-byte v off (logior (ash digit 4) (logand b #x0f)))
+          (progn (%insert-byte v (hexv-cursor v) (ash digit 4))   ; new byte, high nibble
                  (setf (hexv-nibble v) 1))
-          (progn (%set-byte v off (logior (logand b #xf0) digit))
-                 (%move v 1))))))                       ; %move resets the nibble to hi
+          (progn (%set-byte v (hexv-cursor v)                     ; complete its low nibble
+                            (logior (logand (aref (hexv-bytes v) (hexv-cursor v)) #xf0) digit))
+                 (%move v 1)))
+      (when (plusp (hexv-length v))
+        (let* ((off (hexv-cursor v)) (b (aref (hexv-bytes v) off)))
+          (if (zerop (hexv-nibble v))
+              (progn (%set-byte v off (logior (ash digit 4) (logand b #x0f)))
+                     (setf (hexv-nibble v) 1))
+              (progn (%set-byte v off (logior (logand b #xf0) digit))
+                     (%move v 1)))))))                  ; %move resets the nibble to hi
 
 (defun %ascii-input (v char)
-  "Overwrite the current byte with CHAR's code and advance the cursor."
-  (when (plusp (hexv-length v))
-    (%set-byte v (hexv-cursor v) (char-code char))
-    (%move v 1)))
+  "Insert (insert mode) or overwrite (overwrite mode) the current byte with CHAR's code,
+then advance the cursor."
+  (cond
+    ((eq (hexv-mode v) :insert) (%insert-byte v (hexv-cursor v) (char-code char)) (%move v 1))
+    ((plusp (hexv-length v))    (%set-byte v (hexv-cursor v) (char-code char)) (%move v 1))))
+
+;;; --- search -----------------------------------------------------------------
+
+(defun %parse-search (s)
+  "Parse a search string into an octet vector: a leading / means the rest is literal ASCII;
+otherwise it is hex bytes (spaces optional, even number of digits).  NIL if unparseable."
+  (cond
+    ((zerop (length s)) nil)
+    ((char= (char s 0) #\/) (map '(vector (unsigned-byte 8)) #'char-code (subseq s 1)))
+    (t (let ((h (remove #\Space s)))
+         (when (and (plusp (length h)) (evenp (length h))
+                    (every (lambda (c) (digit-char-p c 16)) h))
+           (loop with out = (make-array (floor (length h) 2) :element-type '(unsigned-byte 8))
+                 for i below (length out)
+                 do (setf (aref out i) (parse-integer h :start (* i 2) :end (+ 2 (* i 2)) :radix 16))
+                 finally (return out)))))))
+
+(defun %find-bytes (buf pattern start)
+  "The first index >= START where PATTERN occurs in BUF, or NIL (no wrap)."
+  (let ((n (length buf)) (m (length pattern)))
+    (when (plusp m)
+      (loop for i from (max 0 start) to (- n m)
+            when (loop for j below m always (= (aref buf (+ i j)) (aref pattern j)))
+              return i))))
+
+(defun hex-search (v pattern &optional (from (1+ (hexv-cursor v))))
+  "Move the cursor to the next occurrence of PATTERN (an octet vector) at or after FROM,
+wrapping once to the start.  Returns the offset, or NIL when there is no match."
+  (let* ((buf (hexv-bytes v))
+         (hit (or (%find-bytes buf pattern from)
+                  (%find-bytes buf pattern 0))))          ; wrap
+    (when hit (%goto v hit))
+    hit))
+
+(defun hex-prompt-find (v)
+  "Prompt for a search pattern and jump to the next match; an empty entry repeats the last
+search (find-next).  Reports the outcome, and never signals."
+  (let ((s (prompt-string " Find " "Hex bytes (deadbeef) or /text:")))
+    (when s
+      (let ((pat (if (and (zerop (length (string-trim " " s))) (hexv-last-search v))
+                     (hexv-last-search v)
+                     (%parse-search s))))
+        (cond
+          ((null pat) (setf (hexv-message v) "invalid search pattern"))
+          (t (setf (hexv-last-search v) pat)
+             (let ((hit (hex-search v pat)))
+               (setf (hexv-message v) (if hit (format nil "found at 0x~X" hit) "not found")))))))
+    (invalidate v)))
 
 (defun hex-toggle-pane (v)
   "Switch between the hex and ASCII edit panes."
@@ -224,8 +348,9 @@ finishes the byte and advances the cursor."
   (invalidate v))
 
 (defmethod frame-indicator ((v hex-view))
-  (format nil " ~(~a~) 0x~X/0x~X~:[~; *~] "
-          (hexv-pane v) (hexv-cursor v) (hexv-length v) (hexv-modified v)))
+  (format nil " ~(~a~) ~:[ovr~;ins~] 0x~X/0x~X~:[~; *~] "
+          (hexv-pane v) (eq (hexv-mode v) :insert)
+          (hexv-cursor v) (hexv-length v) (hexv-modified v)))
 
 ;;; --- drawing ----------------------------------------------------------------
 
@@ -255,8 +380,9 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
                   (draw-text v (%ascii-col i) r
                              (string (if (<= 32 byte 126) (code-char byte) #\.))
                              (%cell-attr v off :ascii)))))))))
-    ;; a real block cursor in the active pane (only when focused)
-    (when (and (view-focused-p v) *screen* (plusp n))
+    ;; a real block cursor in the active pane (only when focused); in insert mode it can
+    ;; sit at the append position (offset = length), including an empty buffer.
+    (when (and (view-focused-p v) *screen* (or (plusp n) (eq (hexv-mode v) :insert)))
       (let* ((off (hexv-cursor v)) (row (- (floor off +bpr+) top)) (col (mod off +bpr+)))
         (when (<= 0 row (1- h))
           (let ((cx (if (eq (hexv-pane v) :hex)
@@ -294,11 +420,20 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
       ((eql ks :pgup)  (%move v (- (* +bpr+ (%page v)))) (setf (handled-p e) t))
       ((eql ks :pgdn)  (%move v (* +bpr+ (%page v)))    (setf (handled-p e) t))
       ((eql ks :home)  (%goto v 0)                      (setf (handled-p e) t))
-      ((eql ks :end)   (%goto v (1- (hexv-length v)))   (setf (handled-p e) t))
+      ((eql ks :end)   (%goto v (%max-cursor v))        (setf (handled-p e) t))
+      ((eql ks :ins)   (hex-toggle-mode v)              (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\s) (%hx-save-report v)   (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\z) (hex-undo v)          (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\y) (hex-redo v)          (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\g) (hex-prompt-goto v)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\f) (hex-prompt-find v)   (setf (handled-p e) t))
+      ;; insert mode: Del removes the byte under the cursor, Bksp the one before it
+      ((and (eq (hexv-mode v) :insert) (eql ks :del))
+       (%delete-byte v (hexv-cursor v))                 (setf (handled-p e) t))
+      ((and (eq (hexv-mode v) :insert) (eql ks :back))
+       (let ((c (hexv-cursor v)))
+         (when (plusp c) (%delete-byte v (1- c)) (%goto v (1- c))))
+       (setf (handled-p e) t))
       ((and (eq (hexv-pane v) :hex) (characterp ks) (digit-char-p ks 16) (%edit-key-p mods))
        (%hex-input v (digit-char-p ks 16))              (setf (handled-p e) t))
       ((and (eq (hexv-pane v) :ascii) (characterp ks) (graphic-char-p ks)
@@ -326,8 +461,11 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
     ("PgUp / PgDn"  . "page up / down")
     ("Home / End"   . "start / end of file")
     ("Tab"          . "switch the hex / ASCII pane")
-    ("0-9 a-f"      . "overwrite the byte's nibbles (hex pane)")
-    ("(printable)"  . "overwrite the byte (ASCII pane)")
-    ("Ctrl+Z / Ctrl+Y" . "undo / redo")
+    ("Insert"       . "toggle overwrite / insert mode")
+    ("0-9 a-f"      . "edit the byte's nibbles (hex pane)")
+    ("(printable)"  . "edit the byte (ASCII pane)")
+    ("Bksp / Del"   . "delete a byte (insert mode)")
+    ("Ctrl+F"       . "find hex bytes or /text (empty = find next)")
     ("Ctrl+G"       . "go to a hex offset")
+    ("Ctrl+Z / Ctrl+Y" . "undo / redo")
     ("Ctrl+S"       . "save to the file")))

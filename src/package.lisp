@@ -27,6 +27,9 @@
    #:hex-save
    #:hex-undo
    #:hex-redo
+   #:hex-search
+   #:hex-toggle-mode
+   #:hexv-mode
    #:read-file-bytes
    #:write-file-bytes
    #:hexv-bytes

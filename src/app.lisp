@@ -29,8 +29,8 @@ Tab toggles the hex/ASCII pane, and it reports unsaved edits so the desktop guar
     (when (and v s)
       (setf (static-text-text s)
             (or (and (hexv-message v) (format nil " ~A " (hexv-message v)))   ; transient note takes priority
-                (format nil " ~:[HEX~;ASCII~] · byte 0x~X of 0x~X · Tab: pane · Ctrl-Z: undo · Ctrl-G: goto · Ctrl-S: save · Esc: close "
-                        (eq (hexv-pane v) :ascii) (hexv-cursor v) (hexv-length v)))))))
+                (format nil " ~:[HEX~;ASCII~]/~:[OVR~;INS~] · 0x~X of 0x~X · Tab: pane · Ins: mode · Ctrl-F: find · Ctrl-G: goto · Ctrl-Z: undo · Ctrl-S: save "
+                        (eq (hexv-pane v) :ascii) (eq (hexv-mode v) :insert) (hexv-cursor v) (hexv-length v)))))))
 
 (defmethod draw :before ((w hex-window)) (%hx-status w) (%hx-title w))   ; keep title/status live each repaint
 

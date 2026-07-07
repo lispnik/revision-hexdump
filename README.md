@@ -26,15 +26,26 @@ classic hex-editor default).
 | `PgUp` `PgDn` | page up / down |
 | `Home` `End` | start / end of file |
 | `Tab` | switch the **hex ⇄ ASCII** edit pane |
-| `0`–`9` `a`–`f` | overwrite the byte's high then low nibble (hex pane) |
-| *(printable)* | overwrite the byte (ASCII pane) |
+| `Insert` | toggle **overwrite ⇄ insert** mode |
+| `0`–`9` `a`–`f` | edit the byte's high then low nibble (hex pane) |
+| *(printable)* | edit the byte (ASCII pane) |
+| `Bksp` `Del` | delete a byte (insert mode) |
+| `Ctrl+F` | find — hex bytes (`deadbeef`) or `/text`; empty repeats (find-next) |
+| `Ctrl+G` | go to a hex offset (`1F` or `0x1F`) |
+| `Ctrl+Z` `Ctrl+Y` | undo / redo |
 | `Ctrl+S` | save to the file |
 | mouse click | move the cursor to a byte / pick a pane |
 | wheel | scroll |
 
 In the **hex** pane a byte takes two keystrokes (high nibble, then low), after which
-the cursor advances. In the **ASCII** pane one printable key overwrites the byte.
+the cursor advances. In the **ASCII** pane one printable key edits the byte.
 Edited-but-unsaved bytes are flagged, and the title / frame show a `*` until you save.
+
+**Overwrite** mode (the default) keeps the file's size — editing replaces the byte under
+the cursor. **Insert** mode (toggle with `Insert`) lets typing *insert* new bytes and
+`Bksp`/`Del` *remove* them, so you can change the file's length or fill an empty file.
+Undo/redo (`Ctrl+Z`/`Ctrl+Y`) covers overwrite, insert, and delete alike, and the frame
+indicator shows the pane and mode (`hex ins 0x1F/0x2C *`).
 
 ## As a desktop window
 
