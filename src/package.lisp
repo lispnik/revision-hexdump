@@ -25,6 +25,8 @@
    ;; buffer logic (usable on its own, no screen needed)
    #:hex-load
    #:hex-save
+   #:hex-undo
+   #:hex-redo
    #:read-file-bytes
    #:write-file-bytes
    #:hexv-bytes

@@ -173,6 +173,69 @@
         (fiveam:is (equal (list (namestring p)) (window-save-state win))
                    "window-save-state remembers the file")))))
 
+;;; --- undo / redo + the clean checkpoint -------------------------------------
+
+(fiveam:test noop-edit-does-nothing
+  (let ((v (%view #(#x42))))
+    (%set-byte v 0 #x42)                                ; writing a byte its current value
+    (fiveam:is-false (hexv-modified v) "a no-op write does not dirty the buffer")
+    (fiveam:is (zerop (hexv-hpos v)) "and records no history")))
+
+(fiveam:test undo-redo
+  (let ((v (%view #(#x11 #x22 #x33))))
+    (%hex-input v 10) (%hex-input v 10)                 ; byte 0 -> 0xAA (two nibble edits)
+    (fiveam:is (= #xAA (aref (hexv-bytes v) 0)))
+    (hex-undo v) (fiveam:is (= #xA1 (aref (hexv-bytes v) 0)) "undo reverts the low nibble (0xAA -> 0xA1)")
+    (hex-undo v) (fiveam:is (= #x11 (aref (hexv-bytes v) 0)) "undo reverts to the original byte")
+    (fiveam:is-false (hexv-modified v) "back at the load checkpoint -> clean")
+    (hex-redo v) (hex-redo v)
+    (fiveam:is (= #xAA (aref (hexv-bytes v) 0)) "redo reapplies both nibbles")
+    (fiveam:is-true (hexv-modified v))))
+
+(fiveam:test undo-redo-empty
+  (let ((v (%view #(1 2))))
+    (fiveam:is-false (hex-undo v) "nothing to undo on a fresh buffer")
+    (fiveam:is-false (hex-redo v) "nothing to redo")))
+
+(fiveam:test new-edit-truncates-redo
+  (let ((v (%view #(0 0 0))))
+    (%set-byte v 0 #xAA) (%set-byte v 1 #xBB)
+    (hex-undo v)                                        ; redo tail now holds the byte-1 edit
+    (%set-byte v 2 #xCC)                                ; a fresh edit discards it
+    (fiveam:is-false (hex-redo v) "a fresh edit truncates the redo tail")
+    (fiveam:is (= #xAA (aref (hexv-bytes v) 0)))
+    (fiveam:is (= #x00 (aref (hexv-bytes v) 1)) "the undone edit stays undone")
+    (fiveam:is (= #xCC (aref (hexv-bytes v) 2)))))
+
+(fiveam:test modified-checkpoint
+  (with-temp-file (p (%buf '(0 0)))
+    (let ((v (%view)))
+      (hex-load v p)
+      (fiveam:is-false (hexv-modified v))
+      (%set-byte v 0 #x99) (fiveam:is-true (hexv-modified v))
+      (hex-save v)         (fiveam:is-false (hexv-modified v) "clean right after save")
+      (hex-undo v)         (fiveam:is-true (hexv-modified v) "undoing past the saved state is dirty again")
+      (hex-redo v)         (fiveam:is-false (hexv-modified v) "redoing back to the saved state is clean again"))))
+
+;;; --- robust save ------------------------------------------------------------
+
+(fiveam:test save-error-is-caught
+  (let ((v (%view #(1 2 3))))
+    (%set-byte v 0 #xFF)
+    (multiple-value-bind (path err) (hex-save v "/no-such-dir-xqz/nope.bin")
+      (fiveam:is-false path "a failed save returns no path")
+      (fiveam:is-true err "a failed save returns the error rather than signalling")
+      (fiveam:is-true (hexv-modified v) "a failed save leaves the buffer modified"))))
+
+;;; --- go-to-offset parsing ---------------------------------------------------
+
+(fiveam:test parse-offset
+  (fiveam:is (= 31  (%parse-offset "1F")))
+  (fiveam:is (= 31  (%parse-offset "0x1F")))
+  (fiveam:is (= 255 (%parse-offset "  ff  ")))
+  (fiveam:is-false (%parse-offset "xyz"))
+  (fiveam:is-false (%parse-offset "")))
+
 ;;; --- run --------------------------------------------------------------------
 
 (let ((ok (fiveam:run! 'hexdump)))

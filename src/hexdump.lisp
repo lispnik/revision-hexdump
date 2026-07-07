@@ -62,9 +62,15 @@
              :documentation "Which nibble of the current byte the hex pane will edit next (0 hi, 1 lo).")
    (pane     :initform :hex :accessor hexv-pane        ; :hex | :ascii
              :documentation "The active edit pane, :HEX or :ASCII (Tab toggles).")
-   (modified :initform nil :accessor hexv-modified     ; unsaved edits?
-             :documentation "True once a byte has been edited since the last load/save.")
-   (changed  :initform (make-hash-table) :accessor hexv-changed)  ; offset -> T, edited since load/save
+   (changed  :initform (make-hash-table) :accessor hexv-changed)  ; offset -> T, touched since load/save (highlight)
+   (history  :initform (make-array 0 :adjustable t :fill-pointer 0) :accessor hexv-history
+             :documentation "The edit log: a vector of (OFFSET OLD NEW) records for undo/redo.")
+   (hpos     :initform 0 :accessor hexv-hpos            ; how many history edits are currently applied
+             :documentation "Number of HISTORY edits applied to the buffer (the undo/redo position).")
+   (saved-pos :initform 0 :accessor hexv-saved-pos      ; HPOS at the last load/save; -1 = clean state discarded
+             :documentation "HPOS at the last load/save -- the clean checkpoint; -1 once it is unreachable.")
+   (message  :initform nil :accessor hexv-message
+             :documentation "A transient status note (save / go-to / undo feedback), shown until the next move.")
    (filename :initarg :filename :initform nil :accessor hexv-filename)
    (on-change :initarg :on-change :initform nil :accessor hexv-on-change
               :documentation "Optional thunk of the view, called after each edit."))
@@ -79,27 +85,38 @@ it answers the scroll protocol so a hosting window draws a frame scrollbar."))
 (defun %page (v) (max 1 (rect-height (view-bounds v))))
 (defun %rows (v) (max 1 (ceiling (max 1 (hexv-length v)) +bpr+)))
 
+(defun hexv-modified (v)
+  "Does V differ from the last saved/loaded state?  True iff the applied-edit position
+has moved off the clean checkpoint (see HEXV-SAVED-POS)."
+  (/= (hexv-hpos v) (hexv-saved-pos v)))
+
 ;;; --- load / save ------------------------------------------------------------
 
 (defun hex-load (v path)
-  "Load PATH's bytes into V, resetting the cursor and edit state."
+  "Load PATH's bytes into V, resetting the cursor and the whole edit history."
   (setf (hexv-bytes v) (read-file-bytes path)
         (hexv-filename v) path
         (hexv-cursor v) 0 (hexv-top v) 0 (hexv-nibble v) 0
-        (hexv-modified v) nil)
+        (fill-pointer (hexv-history v)) 0 (hexv-hpos v) 0 (hexv-saved-pos v) 0
+        (hexv-message v) nil)
   (clrhash (hexv-changed v))
   (invalidate v)
   v)
 
 (defun hex-save (v &optional (path (hexv-filename v)))
-  "Write V's buffer to PATH (default its own filename); clear the modified state.
-Returns the path on success, NIL when there is no path."
-  (when path
-    (write-file-bytes path (hexv-bytes v))
-    (setf (hexv-filename v) path (hexv-modified v) nil)
-    (clrhash (hexv-changed v))
-    (invalidate v)
-    path))
+  "Write V's buffer to PATH (default its own filename) and mark it clean.  Returns
+(values PATH NIL) on success, (values NIL ERROR) when the write failed, or (values NIL NIL)
+when there is no path.  It never signals -- a failed save must not crash the host loop."
+  (cond
+    ((null path) (values nil nil))
+    (t (handler-case
+           (progn (write-file-bytes path (hexv-bytes v))
+                  (setf (hexv-filename v) path
+                        (hexv-saved-pos v) (hexv-hpos v))   ; this edit position is now the clean checkpoint
+                  (clrhash (hexv-changed v))
+                  (invalidate v)
+                  (values path nil))
+         (error (e) (values nil e))))))
 
 ;;; --- movement ---------------------------------------------------------------
 
@@ -110,7 +127,9 @@ Returns the path on success, NIL when there is no path."
           ((>= row (+ (hexv-top v) page)) (setf (hexv-top v) (1+ (- row page)))))))
 
 (defun %goto (v off)
-  "Move the cursor to byte OFF (clamped), reset the nibble, and reveal it."
+  "Move the cursor to byte OFF (clamped), reset the nibble, clear any transient note,
+and reveal it."
+  (setf (hexv-message v) nil)
   (let ((n (hexv-length v)))
     (when (plusp n)
       (setf (hexv-cursor v) (max 0 (min off (1- n)))
@@ -122,12 +141,55 @@ Returns the path on success, NIL when there is no path."
 ;;; --- editing (overwrite; preserves the buffer size) -------------------------
 
 (defun %set-byte (v off value)
-  "Overwrite byte OFF with VALUE, recording the edit."
-  (setf (aref (hexv-bytes v) off) (logand value #xff)
-        (gethash off (hexv-changed v)) t
-        (hexv-modified v) t)
-  (when (hexv-on-change v) (funcall (hexv-on-change v) v))
-  (invalidate v))
+  "Overwrite byte OFF with VALUE (0-255), logging an undo step.  A no-op write (the byte
+already holds VALUE) does nothing.  A fresh edit discards any redo tail."
+  (let ((old (aref (hexv-bytes v) off)) (new (logand value #xff)))
+    (unless (= old new)
+      (setf (fill-pointer (hexv-history v)) (hexv-hpos v))          ; drop the redo tail
+      (when (> (hexv-saved-pos v) (hexv-hpos v))                    ; the saved state was in that tail
+        (setf (hexv-saved-pos v) -1))                              ; -> now unreachable (stays modified)
+      (vector-push-extend (list off old new) (hexv-history v))
+      (incf (hexv-hpos v))
+      (setf (aref (hexv-bytes v) off) new
+            (gethash off (hexv-changed v)) t)
+      (when (hexv-on-change v) (funcall (hexv-on-change v) v))
+      (invalidate v))))
+
+(defun hex-undo (v)
+  "Undo the most recent edit; returns T when one was undone."
+  (if (plusp (hexv-hpos v))
+      (destructuring-bind (off old new) (aref (hexv-history v) (decf (hexv-hpos v)))
+        (declare (ignore new))
+        (setf (aref (hexv-bytes v) off) old)
+        (%goto v off) (invalidate v) t)
+      (progn (setf (hexv-message v) "nothing to undo") (invalidate v) nil)))
+
+(defun hex-redo (v)
+  "Reapply the next undone edit; returns T when one was redone."
+  (if (< (hexv-hpos v) (fill-pointer (hexv-history v)))
+      (destructuring-bind (off old new) (aref (hexv-history v) (hexv-hpos v))
+        (declare (ignore old))
+        (incf (hexv-hpos v))
+        (setf (aref (hexv-bytes v) off) new
+              (gethash off (hexv-changed v)) t)
+        (%goto v off) (invalidate v) t)
+      (progn (setf (hexv-message v) "nothing to redo") (invalidate v) nil)))
+
+(defun %parse-offset (s)
+  "Parse a hex offset string (an optional 0x prefix, else plain hex), or NIL."
+  (let ((str (string-trim " " s)))
+    (when (plusp (length str))
+      (let ((h (if (and (> (length str) 1) (char-equal (char str 0) #\0) (char-equal (char str 1) #\x))
+                   (subseq str 2) str)))
+        (ignore-errors (parse-integer h :radix 16))))))
+
+(defun hex-prompt-goto (v)
+  "Prompt for a hex offset and jump to it (an invalid entry is reported, not an error)."
+  (let ((s (prompt-string " Go to offset " "Hex offset (e.g. 1F or 0x1F):")))
+    (when s
+      (let ((off (%parse-offset s)))
+        (if off (%goto v off) (setf (hexv-message v) "invalid offset"))))
+    (invalidate v)))
 
 (defun %hex-input (v digit)
   "Apply hex DIGIT (0-15) to the current byte's active nibble; the low nibble
@@ -173,7 +235,7 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
   (let ((cur (= off (hexv-cursor v))))
     (cond ((and cur (eq (hexv-pane v) cur-pane)) (role :focused))
           (cur                                   (role :input-focused))
-          ((gethash off (hexv-changed v))        (role :error))
+          ((and (hexv-modified v) (gethash off (hexv-changed v))) (role :error))  ; flagged only while dirty
           (t                                     (role :normal)))))
 
 (defmethod draw ((v hex-view))
@@ -210,6 +272,18 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
 (defun %edit-key-p (mods)                               ; a plain edit key (Shift ok for A-F / uppercase)
   (not (logtest mods (logior +md-ctrl+ +md-alt+))))
 
+(defun %ctrl-char-p (ks mods ch)
+  (and (characterp ks) (char-equal ks ch) (logtest mods +md-ctrl+)))
+
+(defun %hx-save-report (v)
+  "Save V and record the outcome (bytes written, or the failure) as its status note."
+  (multiple-value-bind (path err) (hex-save v)
+    (setf (hexv-message v)
+          (cond (path (format nil "saved ~D byte~:P to ~A" (hexv-length v) (file-namestring path)))
+                (err  (format nil "save failed: ~A" err))
+                (t    "no file — nothing to save")))
+    (invalidate v)))
+
 (defmethod handle-event ((v hex-view) (e key-event))
   (let ((ks (event-keysym e)) (mods (event-modifiers e)))
     (cond
@@ -221,8 +295,10 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
       ((eql ks :pgdn)  (%move v (* +bpr+ (%page v)))    (setf (handled-p e) t))
       ((eql ks :home)  (%goto v 0)                      (setf (handled-p e) t))
       ((eql ks :end)   (%goto v (1- (hexv-length v)))   (setf (handled-p e) t))
-      ((and (characterp ks) (char-equal ks #\s) (logtest mods +md-ctrl+))
-       (hex-save v)                                     (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\s) (%hx-save-report v)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\z) (hex-undo v)          (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\y) (hex-redo v)          (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\g) (hex-prompt-goto v)   (setf (handled-p e) t))
       ((and (eq (hexv-pane v) :hex) (characterp ks) (digit-char-p ks 16) (%edit-key-p mods))
        (%hex-input v (digit-char-p ks 16))              (setf (handled-p e) t))
       ((and (eq (hexv-pane v) :ascii) (characterp ks) (graphic-char-p ks)
@@ -252,4 +328,6 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
     ("Tab"          . "switch the hex / ASCII pane")
     ("0-9 a-f"      . "overwrite the byte's nibbles (hex pane)")
     ("(printable)"  . "overwrite the byte (ASCII pane)")
+    ("Ctrl+Z / Ctrl+Y" . "undo / redo")
+    ("Ctrl+G"       . "go to a hex offset")
     ("Ctrl+S"       . "save to the file")))
