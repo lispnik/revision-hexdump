@@ -60,4 +60,10 @@
    #:hex-toggle-inspector
    #:hex-toggle-lock
    #:hex-toggle-mark
-   #:hex-next-mark))
+   #:hex-next-mark
+   ;; structural templates
+   #:parse-template
+   #:hex-apply-template
+   #:hex-clear-template
+   #:hexv-fields
+   #:*templates*))

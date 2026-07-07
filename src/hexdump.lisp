@@ -204,6 +204,9 @@ A one-entry cache makes the common sequential scan O(1) per byte."
              :documentation "Render control bytes as Unicode control pictures (␀␁…␡) rather than '.' (Ctrl-P toggles).")
    (marks    :initform (make-hash-table) :accessor hexv-marks    ; bookmarked offsets (a set)
              :documentation "Bookmarked offsets: Ctrl-K toggles one at the cursor, Ctrl-N/Ctrl-P jump between them.")
+   (fields   :initform nil :accessor hexv-fields         ; a vector of TFIELDs from an applied template, or NIL
+             :documentation "The parsed leaf fields (a vector of TFIELDs) of an applied structural template, or NIL.")
+   (template-name :initform nil :accessor hexv-template-name)   ; the applied template's name, for display
    (bpr      :initform +bpr+ :accessor hexv-bpr          ; bytes per row, chosen from the view width by LAYOUT
              :documentation "Bytes shown per row; LAYOUT sizes it to the view width (a multiple of 8).")
    (big-endian :initform nil :accessor hexv-big-endian  ; data-inspector byte order (NIL = little-endian)
@@ -287,7 +290,7 @@ a smaller one is loaded fully and stays editable."
     (setf (hexv-filename v) path
           (hexv-cursor v) 0 (hexv-top v) 0 (hexv-nibble v) 0 (hexv-anchor v) nil
           (fill-pointer (hexv-history v)) 0 (hexv-hpos v) 0 (hexv-saved-pos v) 0
-          (hexv-message v) nil))
+          (hexv-message v) nil (hexv-fields v) nil (hexv-template-name v) nil))
   (clrhash (hexv-changed v))
   (invalidate v)
   v)
@@ -412,8 +415,10 @@ so a multi-byte operation (paste, cut, replace) is one undo/redo."
 
 (defun %after-edit (v &optional structural)
   "Shared bookkeeping after an edit: a STRUCTURAL (insert/delete) edit shifts offsets, so
-drop the offset-keyed change highlights; run the on-change hook; repaint."
-  (when structural (clrhash (hexv-changed v)))
+drop the offset-keyed change highlights and any applied template; run the hook; repaint."
+  (when structural
+    (clrhash (hexv-changed v))
+    (setf (hexv-fields v) nil (hexv-template-name v) nil))
   (when (hexv-on-change v) (funcall (hexv-on-change v) v))
   (invalidate v))
 
@@ -658,6 +663,159 @@ buffer end shows as \"—\"."
   (setf (hexv-big-endian v) (not (hexv-big-endian v)))
   (invalidate v))
 
+;;; --- structural templates ---------------------------------------------------
+;;; A template describes a binary layout as (NAME TYPE) field specs, optionally led
+;;; by (:endian :big|:little).  TYPE is a scalar keyword (:u8 .. :i64, :f32/:f64),
+;;; (:bytes N), (:string N), (:array ELEMTYPE N), or (:struct FIELD...).  Applying a
+;;; template at an offset parses the bytes into a flat list of typed leaf fields,
+;;; which annotate the dump (each field's bytes tint; the field at the cursor shows).
+
+(defstruct (tfield (:constructor %tfield) (:conc-name tf-))
+  path type offset size value)
+
+(defun %scalar-size (type)
+  (case type ((:u8 :i8) 1) ((:u16 :i16) 2) ((:u32 :i32 :f32) 4) ((:u64 :i64 :f64) 8) (t 0)))
+
+(defun %read-scalar (ref len offset type be)
+  "Decode a scalar TYPE at OFFSET (BE = big-endian), or NIL if it runs past LEN."
+  (let ((n (%scalar-size type)))
+    (when (and (plusp n) (<= (+ offset n) len))
+      (let ((u (let ((v 0))
+                 (dotimes (k n v)
+                   (setf v (logior (ash v 8) (funcall ref (if be (+ offset k) (+ offset (- n 1 k))))))))))
+        (case type
+          ((:u8 :u16 :u32 :u64) u)
+          (:i8 (%to-signed u 8)) (:i16 (%to-signed u 16)) (:i32 (%to-signed u 32)) (:i64 (%to-signed u 64))
+          (:f32 (ignore-errors (sb-kernel:make-single-float (%to-signed u 32))))
+          (:f64 (ignore-errors (sb-kernel:make-double-float (%to-signed (ash u -32) 32) (logand u #xFFFFFFFF)))))))))
+
+(defun %read-str-field (ref len offset n)
+  (with-output-to-string (s)
+    (loop for k below n for idx = (+ offset k) while (< idx len)
+          for b = (funcall ref idx) while (plusp b)
+          do (write-char (if (<= 32 b 126) (code-char b) #\.) s))))
+
+(defun %read-bytes-field (ref len offset n)
+  (with-output-to-string (s)
+    (loop for k below n for idx = (+ offset k) while (< idx len)
+          do (format s "~:[~; ~]~2,'0X" (plusp k) (funcall ref idx)))))
+
+(defun %parse-into (path type ref len offset be acc)
+  "Parse field PATH of TYPE at OFFSET; return (values SIZE ACC) with leaf TFIELDs pushed on ACC."
+  (cond
+    ((keywordp type)
+     (let ((sz (%scalar-size type)))
+       (values sz (cons (%tfield :path path :type type :offset offset :size sz
+                                 :value (%read-scalar ref len offset type be)) acc))))
+    ((eq (first type) :bytes)
+     (let ((n (second type)))
+       (values n (cons (%tfield :path path :type :bytes :offset offset :size n
+                                :value (%read-bytes-field ref len offset n)) acc))))
+    ((eq (first type) :string)
+     (let ((n (second type)))
+       (values n (cons (%tfield :path path :type :string :offset offset :size n
+                                :value (%read-str-field ref len offset n)) acc))))
+    ((eq (first type) :array)
+     (destructuring-bind (elem n) (rest type)
+       (let ((total 0))
+         (dotimes (i n (values total acc))
+           (multiple-value-bind (sz a) (%parse-into (format nil "~a[~d]" path i) elem ref len (+ offset total) be acc)
+             (setf total (+ total sz) acc a))))))
+    ((eq (first type) :struct)
+     (let ((total 0))
+       (dolist (f (rest type) (values total acc))
+         (multiple-value-bind (sz a)
+             (%parse-into (format nil "~a.~(~a~)" path (first f)) (second f) ref len (+ offset total) be acc)
+           (setf total (+ total sz) acc a)))))
+    (t (values 0 acc))))
+
+(defun parse-template (template ref len offset)
+  "Parse TEMPLATE against bytes read via (funcall REF i) over [0,LEN), starting at OFFSET;
+return a flat list of leaf TFIELDs in file order."
+  (let ((be nil) (fields template) (total 0) (acc '()))
+    (when (and (consp (first template)) (eq (caar template) :endian))
+      (setf be (eq (second (first template)) :big) fields (rest template)))
+    (dolist (f fields)
+      (multiple-value-bind (sz a)
+          (%parse-into (string-downcase (string (first f))) (second f) ref len (+ offset total) be acc)
+        (setf total (+ total sz) acc a)))
+    (nreverse acc)))
+
+(defun %tf-type-label (tf)
+  (case (tf-type tf)
+    (:bytes  (format nil "bytes~d" (tf-size tf)))
+    (:string (format nil "str~d" (tf-size tf)))
+    (t (string-downcase (string (tf-type tf))))))
+
+(defun %tf-value-str (tf)
+  (let ((v (tf-value tf)))
+    (cond ((null v) "—")
+          ((eq (tf-type tf) :string) (format nil "~s" v))
+          ((eq (tf-type tf) :bytes) v)
+          (t (princ-to-string v)))))
+
+(defun %tf-str (tf)
+  (format nil "~A @0x~X (~A) = ~A" (tf-path tf) (tf-offset tf) (%tf-type-label tf) (%tf-value-str tf)))
+
+(defparameter *templates*
+  '(("BMP file header"
+     (:endian :little)
+     (signature (:string 2)) (file-size :u32) (reserved :u32) (pixel-offset :u32)
+     (dib-size :u32) (width :i32) (height :i32) (planes :u16) (bpp :u16))
+    ("WAV (RIFF) header"
+     (:endian :little)
+     (riff (:string 4)) (chunk-size :u32) (wave (:string 4)) (fmt (:string 4)) (fmt-size :u32)
+     (audio-format :u16) (channels :u16) (sample-rate :u32) (byte-rate :u32)
+     (block-align :u16) (bits-per-sample :u16))
+    ("GIF header"
+     (:endian :little)
+     (signature (:string 3)) (version (:string 3)) (width :u16) (height :u16)
+     (flags :u8) (bg-color :u8) (aspect :u8)))
+  "Built-in structural templates: (NAME . FIELD-SPECS...).  Applied at the cursor.")
+
+(defun hex-apply-template (v template name)
+  "Parse TEMPLATE at the cursor and annotate the dump with its fields."
+  (setf (hexv-fields v) (coerce (parse-template template (lambda (i) (%bref v i))
+                                                (hexv-length v) (hexv-cursor v))
+                                'vector)
+        (hexv-template-name v) name)
+  (invalidate v))
+
+(defun hex-clear-template (v)
+  (setf (hexv-fields v) nil (hexv-template-name v) nil) (invalidate v))
+
+(defun %field-at (v off)
+  "The applied-template field spanning OFF, or NIL."
+  (when (hexv-fields v)
+    (loop for tf across (hexv-fields v)
+          when (and (>= off (tf-offset tf)) (< off (+ (tf-offset tf) (tf-size tf)))) return tf)))
+
+(defun hexv-field-line (v)
+  "A one-line description of the template field at the cursor, or NIL."
+  (let ((tf (%field-at v (hexv-cursor v)))) (and tf (concatenate 'string "field: " (%tf-str tf)))))
+
+(defun hex-prompt-template (v)
+  "Choose a structural template (or (none)) and apply it at the cursor."
+  (let ((choice (popup-choose (cons "(none)" (mapcar #'first *templates*)) :title " Apply template ")))
+    (when choice
+      (cond ((string= choice "(none)") (hex-clear-template v))
+            (t (let ((tmpl (cdr (assoc choice *templates* :test #'string=))))
+                 (when tmpl
+                   (hex-apply-template v tmpl choice)
+                   (setf (hexv-message v) (format nil "applied ~a (~d fields)" choice (length (hexv-fields v)))))))))
+    (invalidate v)))
+
+(defun hex-field-list (v)
+  "Pick a field from the applied template and jump the cursor to it."
+  (if (null (hexv-fields v))
+      (setf (hexv-message v) "no template — Ctrl-J to apply one")
+      (let* ((strs (map 'list #'%tf-str (hexv-fields v)))
+             (choice (popup-choose strs :title (format nil " ~a " (hexv-template-name v)))))
+        (when choice
+          (let ((i (position choice strs :test #'string=)))
+            (when i (%goto v (tf-offset (aref (hexv-fields v) i))))))))
+  (invalidate v))
+
 ;;; --- selection + clipboard --------------------------------------------------
 
 (defvar *clipboard* (make-array 0 :element-type '(unsigned-byte 8))
@@ -771,14 +929,16 @@ count.  An empty replacement deletes the matches."
 
 ;;; --- drawing ----------------------------------------------------------------
 
-(defun %cell-attr (v off cur-pane sel)
+(defun %cell-attr (v off cur-pane sel fld)
   "Colour for byte OFF in the pane CUR-PANE: cursor cell, selection (SEL is (LO . HI) or
-NIL), a bookmark, an edited-but-unsaved byte, or plain."
+NIL), a bookmark, the current template field (FLD is (LO . HI-exclusive) or NIL), an
+edited-but-unsaved byte, or plain."
   (let ((cur (= off (hexv-cursor v))))
     (cond ((and cur (eq (hexv-pane v) cur-pane)) (role :focused))
           (cur                                   (role :input-focused))
           ((and sel (<= (car sel) off (cdr sel))) (role :menu-selected))  ; selection
           ((gethash off (hexv-marks v))          (role :label))           ; bookmark
+          ((and fld (<= (car fld) off) (< off (cdr fld))) (role :input))  ; current template field
           ((and (hexv-modified v) (gethash off (hexv-changed v))) (role :error))  ; flagged only while dirty
           (t                                     (role :normal)))))
 
@@ -813,7 +973,9 @@ a middle dot for high bytes) or a plain '.' when control glyphs are off."
   (let* ((b (view-bounds v)) (w (rect-width b)) (h (rect-height b))
          (ax (rect-ax b)) (ay (rect-ay b)) (bpr (hexv-bpr v))
          (n (hexv-length v)) (top (hexv-top v)) (sel (hexv-selection v))
-         (page (%page v)))
+         (page (%page v))
+         (cf (%field-at v (hexv-cursor v)))              ; the template field under the cursor
+         (fld (and cf (cons (tf-offset cf) (+ (tf-offset cf) (tf-size cf))))))
     (dotimes (r h) (fill-row v 0 r w (role :normal)))
     (%draw-ruler v bpr w)                                ; row 0
     (dotimes (dr page)                                   ; dump rows 1 .. page
@@ -824,9 +986,9 @@ a middle dot for high bytes) or a plain '.' when control glyphs are off."
             (let ((off (+ base i)))
               (when (< off n)
                 (let ((byte (%bref v off)))
-                  (draw-text v (%hex-col i) sr (format nil "~2,'0X" byte) (%cell-attr v off :hex sel))
+                  (draw-text v (%hex-col i) sr (format nil "~2,'0X" byte) (%cell-attr v off :hex sel fld))
                   (draw-text v (%ascii-col bpr i) sr (string (%ascii-glyph v byte))
-                             (%cell-attr v off :ascii sel)))))))))
+                             (%cell-attr v off :ascii sel fld)))))))))
     (%draw-inspector v h w)                              ; foot
     ;; a real block cursor in the active pane (only when focused); in insert mode it can
     ;; sit at the append position (offset = length), including an empty buffer.
@@ -885,6 +1047,8 @@ a middle dot for high bytes) or a plain '.' when control glyphs are off."
       ((%ctrl-char-p ks mods #\k) (hex-toggle-mark v)   (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\n) (hex-next-mark v 1)   (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\p) (hex-next-mark v -1)  (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\d) (hex-prompt-template v) (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\q) (hex-field-list v)    (setf (handled-p e) t))
       ;; insert mode: Del removes the byte under the cursor, Bksp the one before it
       ((and (eq (hexv-mode v) :insert) (eql ks :del))
        (%delete-byte v (hexv-cursor v))                 (setf (handled-p e) t))
@@ -973,6 +1137,8 @@ a middle dot for high bytes) or a plain '.' when control glyphs are off."
     ("Ctrl+G"       . "go to a hex offset")
     ("Ctrl+K"       . "toggle a bookmark at the cursor")
     ("Ctrl+N / Ctrl+P" . "jump to the next / previous bookmark")
+    ("Ctrl+D"       . "apply a structural template at the cursor")
+    ("Ctrl+Q"       . "list the template's fields (jump to one)")
     ("Ctrl+T"       . "show / hide the data inspector")
     ("Ctrl+E"       . "toggle the inspector's byte order (LE/BE)")
     ("Ctrl+B"       . "toggle the offset base (hex / decimal)")

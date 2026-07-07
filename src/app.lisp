@@ -32,7 +32,9 @@ Tab toggles the hex/ASCII pane, and it reports unsaved edits so the desktop guar
               (or (and (hexv-message v) (format nil " ~A " (hexv-message v)))   ; transient note takes priority
                   (and sel (format nil " ~D bytes selected · Ctrl-C: copy · Ctrl-X: cut · Ctrl-V: paste · Esc: close "
                                    (1+ (- (cdr sel) (car sel)))))
-                  (format nil " ~:[HEX~;ASCII~]/~A · 0x~X of 0x~X · Ins: mode · Ctrl-F: find · Ctrl-R: replace · Ctrl-G: goto · Ctrl-Z: undo · Ctrl-S: save "
+                  (let ((fl (hexv-field-line v)))       ; a template is applied: show the field at the cursor
+                    (and fl (format nil " ~A · Ctrl-Q: fields · Ctrl-D: template " fl)))
+                  (format nil " ~:[HEX~;ASCII~]/~A · 0x~X of 0x~X · Ins: mode · Ctrl-F: find · Ctrl-D: template · Ctrl-G: goto · Ctrl-Z: undo · Ctrl-S: save "
                           (eq (hexv-pane v) :ascii)
                           (cond ((hexv-readonly v) "RO") ((eq (hexv-mode v) :insert) "INS") (t "OVR"))
                           (hexv-cursor v) (hexv-length v))))))))

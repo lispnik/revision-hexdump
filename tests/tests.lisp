@@ -508,6 +508,52 @@
     (%goto v 30) (hex-toggle-mark v)                     ; clear the mark at 30
     (fiveam:is (= 2 (hash-table-count (hexv-marks v))) "toggling clears a mark")))
 
+;;; --- structural templates ---------------------------------------------------
+
+(defun %ref-of (seq) (lambda (i) (elt seq i)))          ; a byte reader over a literal sequence
+
+(fiveam:test template-scalars-and-endian
+  (let* ((bytes #(#x01 #x02 #x03 #x04 #x05 #x06))
+         (fs (parse-template '((:endian :little) (a :u8) (b :u16) (c :u16))
+                             (%ref-of bytes) (length bytes) 0)))
+    (fiveam:is (= 3 (length fs)))
+    (destructuring-bind (a b c) fs
+      (fiveam:is (and (string= "a" (tf-path a)) (= 0 (tf-offset a)) (= 1 (tf-size a)) (= 1 (tf-value a))))
+      (fiveam:is (and (= 1 (tf-offset b)) (= 2 (tf-size b)) (= #x0302 (tf-value b))) "u16 LE = 0x0302")
+      (fiveam:is (and (= 3 (tf-offset c)) (= #x0504 (tf-value c))))))
+  (let ((fs (parse-template '((:endian :big) (b :u16)) (%ref-of #(#x01 #x02)) 2 0)))
+    (fiveam:is (= #x0102 (tf-value (first fs))) "u16 BE = 0x0102")))
+
+(fiveam:test template-string-bytes-array-struct
+  (let* ((bytes (coerce (map 'vector #'char-code "BM") 'vector))
+         (fs (parse-template '((sig (:string 2))) (%ref-of bytes) 2 0)))
+    (fiveam:is (string= "BM" (tf-value (first fs))) "string field decodes ASCII"))
+  ;; array of 3 u8 + a nested struct, with correct offsets
+  (let* ((bytes #(10 20 30 40 50))
+         (fs (parse-template '((arr (:array :u8 3)) (pair (:struct (x :u8) (y :u8))))
+                             (%ref-of bytes) 5 0)))
+    (fiveam:is (= 5 (length fs)) "3 array elements + 2 struct leaves")
+    (fiveam:is (string= "arr[0]" (tf-path (first fs))))
+    (fiveam:is (= 30 (tf-value (third fs))) "arr[2] = 30")
+    (fiveam:is (and (string= "pair.x" (tf-path (fourth fs))) (= 3 (tf-offset (fourth fs))) (= 40 (tf-value (fourth fs)))))
+    (fiveam:is (and (string= "pair.y" (tf-path (fifth fs))) (= 4 (tf-offset (fifth fs))) (= 50 (tf-value (fifth fs)))))))
+
+(fiveam:test template-truncation
+  (let ((fs (parse-template '((a :u32)) (%ref-of #(1 2)) 2 0)))   ; only 2 of 4 bytes
+    (fiveam:is-false (tf-value (first fs)) "a field running past the end has no value")))
+
+(fiveam:test apply-template-and-field-at
+  (let ((v (%view #(#x42 #x4D #x01 #x00 #x00 #x00))))
+    (hex-apply-template v '((:endian :little) (sig (:string 2)) (size :u32)) "test")
+    (fiveam:is (= 2 (length (hexv-fields v))))
+    (fiveam:is (string= "sig" (tf-path (%field-at v 0))) "cursor at 0 is in the sig field")
+    (fiveam:is (string= "sig" (tf-path (%field-at v 1))) "and at 1")
+    (fiveam:is (string= "size" (tf-path (%field-at v 2))) "byte 2 is the size field")
+    (fiveam:is-false (%field-at v 99) "no field past the parsed region")
+    (%goto v 3) (fiveam:is (search "field: size" (hexv-field-line v)) "field-line reports the field at the cursor")
+    (hex-clear-template v)
+    (fiveam:is-false (hexv-fields v))))
+
 ;;; --- go-to-offset parsing ---------------------------------------------------
 
 (fiveam:test parse-offset

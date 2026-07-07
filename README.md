@@ -31,6 +31,8 @@ classic hex-editor default).
 | `Ctrl+C` `Ctrl+X` `Ctrl+V` | copy / cut / paste the selection |
 | `Ctrl+K` | toggle a **bookmark** at the cursor |
 | `Ctrl+N` `Ctrl+P` | jump to the next / previous bookmark |
+| `Ctrl+D` | apply a **structural template** at the cursor |
+| `Ctrl+Q` | list the template's fields (jump to one) |
 | `Ctrl+T` | show / hide the data inspector |
 | `Ctrl+B` | toggle the offset base (hex / decimal) |
 | `Ctrl+U` | toggle control-character glyphs (`␀␁…` vs `.`) |
@@ -57,6 +59,14 @@ the cursor. **Insert** mode (toggle with `Insert`) lets typing *insert* new byte
 `Bksp`/`Del` *remove* them, so you can change the file's length or fill an empty file.
 Undo/redo (`Ctrl+Z`/`Ctrl+Y`) covers overwrite, insert, and delete alike, and the frame
 indicator shows the pane and mode (`hex ins 0x1F/0x2C *`).
+
+**Structural templates** turn the raw dump into a typed view. A template describes a binary
+layout as `(name type)` fields — `(:endian …)`, scalars (`:u8`…`:i64`, `:f32`/`:f64`),
+`(:string N)`, `(:bytes N)`, `(:array elem N)`, and nested `(:struct …)`. `Ctrl+D` applies
+one (a few are built in — BMP / WAV / GIF headers) at the cursor: the field under the cursor
+is highlighted and named in the status line (`field: file-size @0x2 (u32) = 100`), and
+`Ctrl+Q` lists every parsed field to jump between them. (An edit that shifts offsets clears
+the overlay.)
 
 **Shift**+movement extends a byte **selection** (highlighted); `Ctrl+C`/`Ctrl+X`/`Ctrl+V`
 copy / cut / paste it through a shared byte clipboard (paste inserts in insert mode,
