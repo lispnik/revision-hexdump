@@ -66,4 +66,7 @@
    #:hex-apply-template
    #:hex-clear-template
    #:hexv-fields
-   #:*templates*))
+   #:*templates*
+   #:detect-template
+   #:hex-detect
+   #:load-templates))

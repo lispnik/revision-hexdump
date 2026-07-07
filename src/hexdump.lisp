@@ -761,14 +761,45 @@ them; a length may be an integer or a name (see %RESOLVE-COUNT)."
   "Parse TEMPLATE against bytes read via (funcall REF i) over [0,LEN), starting at OFFSET;
 return a flat list of leaf TFIELDs in file order.  A field spec is (NAME TYPE . OPTIONS)."
   (let ((be nil) (fields template) (total 0) (acc '()) (*tenv* (make-hash-table :test 'equal)))
-    (when (and (consp (first template)) (eq (caar template) :endian))
-      (setf be (eq (second (first template)) :big) fields (rest template)))
+    (loop while (and (consp (first fields)) (keywordp (caar fields)))   ; skip leading options (:endian / :magic)
+          do (when (eq (caar fields) :endian) (setf be (eq (second (first fields)) :big)))
+             (setf fields (rest fields)))
     (dolist (f fields)
       (destructuring-bind (name type &rest options) f
         (multiple-value-bind (sz a)
             (%parse-into (string-downcase (string name)) type options ref len (+ offset total) be acc)
           (setf total (+ total sz) acc a))))
     (nreverse acc)))
+
+(defun %template-magic (template)
+  "The magic byte list a template declares via a leading (:magic BYTES) option, or NIL.
+BYTES may be a string (its char codes) or a literal list of octets."
+  (loop for f in template while (and (consp f) (keywordp (car f)))
+        when (eq (car f) :magic)
+          return (let ((m (second f))) (if (stringp m) (map 'list #'char-code m) m))))
+
+(defun %magic-matches-p (magic ref len offset)
+  (loop for b in magic for k from 0
+        always (and (< (+ offset k) len) (= (funcall ref (+ offset k)) b))))
+
+(defun detect-template (ref len offset)
+  "The name of the first *TEMPLATES* entry whose :magic matches the bytes at OFFSET, or NIL."
+  (loop for (name . specs) in *templates*
+        for magic = (%template-magic specs)
+        when (and magic (%magic-matches-p magic ref len offset)) return name))
+
+(defun load-templates (path)
+  "Read template definitions from PATH -- each top-level form a (NAME SPEC...) entry -- and
+add them to *TEMPLATES* (replacing same-named ones).  Returns the count loaded, or NIL."
+  (ignoring-errors ("load-templates")
+    (with-open-file (s path :if-does-not-exist nil)
+      (when s
+        (loop with n = 0
+              for form = (read s nil :eof) until (eq form :eof)
+              when (and (consp form) (stringp (first form)))
+                do (setf *templates* (cons form (remove (first form) *templates* :key #'first :test #'string=)))
+                   (incf n)
+              finally (return n))))))
 
 (defun %tf-type-label (tf)
   (case (tf-type tf)
@@ -790,16 +821,16 @@ return a flat list of leaf TFIELDs in file order.  A field spec is (NAME TYPE . 
 
 (defparameter *templates*
   '(("BMP file header"
-     (:endian :little)
+     (:endian :little) (:magic "BM")
      (signature (:string 2)) (file-size :u32) (reserved :u32) (pixel-offset :u32)
      (dib-size :u32) (width :i32) (height :i32) (planes :u16) (bpp :u16))
     ("WAV (RIFF) header"
-     (:endian :little)
+     (:endian :little) (:magic "RIFF")
      (riff (:string 4)) (chunk-size :u32) (wave (:string 4)) (fmt (:string 4)) (fmt-size :u32)
      (audio-format :u16) (channels :u16) (sample-rate :u32) (byte-rate :u32)
      (block-align :u16) (bits-per-sample :u16))
     ("GIF header"
-     (:endian :little)
+     (:endian :little) (:magic "GIF8")
      (signature (:string 3)) (version (:string 3)) (width :u16) (height :u16)
      (flags :u8 :flags ((#x80 . "gct") (#x08 . "sort"))) (bg-color :u8) (aspect :u8))
     ("Length-prefixed record"     ; demonstrates dynamic length + enum + flags
@@ -824,6 +855,12 @@ spec is (NAME TYPE . OPTIONS); a length may name a prior field; :enum / :flags a
 (defun hex-clear-template (v)
   (setf (hexv-fields v) nil (hexv-template-name v) nil) (invalidate v))
 
+(defun hex-detect (v)
+  "Detect a template by its magic bytes at the cursor and apply it; returns the name or NIL."
+  (let ((name (detect-template (lambda (i) (%bref v i)) (hexv-length v) (hexv-cursor v))))
+    (when name (hex-apply-template v (cdr (assoc name *templates* :test #'string=)) name))
+    name))
+
 (defun %field-at (v off)
   "The applied-template field spanning OFF, or NIL."
   (when (hexv-fields v)
@@ -835,14 +872,23 @@ spec is (NAME TYPE . OPTIONS); a length may name a prior field; :enum / :flags a
   (let ((tf (%field-at v (hexv-cursor v)))) (and tf (concatenate 'string "field: " (%tf-str tf)))))
 
 (defun hex-prompt-template (v)
-  "Choose a structural template (or (none)) and apply it at the cursor."
-  (let ((choice (popup-choose (cons "(none)" (mapcar #'first *templates*)) :title " Apply template ")))
+  "Choose a structural template (or auto-detect / load-from-file / none) and apply it."
+  (let ((choice (popup-choose (list* "(auto-detect)" "(load file…)" "(none)" (mapcar #'first *templates*))
+                              :title " Apply template ")))
     (when choice
-      (cond ((string= choice "(none)") (hex-clear-template v))
-            (t (let ((tmpl (cdr (assoc choice *templates* :test #'string=))))
-                 (when tmpl
-                   (hex-apply-template v tmpl choice)
-                   (setf (hexv-message v) (format nil "applied ~a (~d fields)" choice (length (hexv-fields v)))))))))
+      (cond
+        ((string= choice "(none)") (hex-clear-template v))
+        ((string= choice "(auto-detect)")
+         (let ((name (hex-detect v)))
+           (setf (hexv-message v) (if name (format nil "detected ~a" name) "no template matched the bytes here"))))
+        ((string= choice "(load file…)")
+         (let ((p (make-file-dialog :dir *project-dir* :title " Load template file ")))
+           (when p (let ((n (load-templates p)))
+                     (setf (hexv-message v) (if n (format nil "loaded ~d template~:P" n) "could not load templates"))))))
+        (t (let ((tmpl (cdr (assoc choice *templates* :test #'string=))))
+             (when tmpl
+               (hex-apply-template v tmpl choice)
+               (setf (hexv-message v) (format nil "applied ~a (~d fields)" choice (length (hexv-fields v)))))))))
     (invalidate v)))
 
 (defun hex-field-list (v)

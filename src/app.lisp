@@ -78,7 +78,7 @@ is loaded eagerly)."
     (add-subview win body)
     (setf (window-scroll-target win) hv (window-help win) :hexdump)
     (if (and path (probe-file path))
-        (hex-load hv path)
+        (progn (hex-load hv path) (hex-detect hv))  ; auto-apply a template if the magic bytes match
         (setf (hexv-mode hv) :insert))              ; a new, empty buffer starts ready to type
     ;; OPEN returns a cleanup thunk: close any paged file source when the window closes.
     (values win hv (lambda (s) (declare (ignore s)) (lambda () (%close-source hv))))))
@@ -114,6 +114,10 @@ twice.  Checked when the desktop builds its menus.")
 
 ;; register the builder (for dt-open + layout save/restore) and, unless a host
 ;; opts out, a Tools item that prompts for a file.
+;; load the user's own templates, if any (plain Lisp data; see LOAD-TEMPLATES)
+(let ((user-file (merge-pathnames ".revision-hexdump.templates" (user-homedir-pathname))))
+  (when (probe-file user-file) (ignore-errors (load-templates user-file))))
+
 (register-window :hexdump (lambda () (make-hexdump)))
 (register-menu :hexdump
       (lambda (dt)

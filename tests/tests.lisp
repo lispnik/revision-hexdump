@@ -564,6 +564,24 @@
   (let ((fs (parse-template '((k :u8 :enum ((9 . "nine")))) (%ref-of #(3)) 1 0)))
     (fiveam:is-false (tf-note (first fs)) "an unmatched enum value has no note")))
 
+(fiveam:test template-detect
+  (let ((bmp (concatenate 'vector (map 'vector #'char-code "BM") #(1 2 3 4))))
+    (fiveam:is (string= "BMP file header" (detect-template (%ref-of bmp) (length bmp) 0)) "magic BM -> BMP"))
+  (fiveam:is-false (detect-template (%ref-of #(0 0 0 0)) 4 0) "no magic match -> NIL")
+  (let ((v (%view (concatenate 'vector (map 'vector #'char-code "GIF89a") #(10 0 20 0 0 0 0)))))
+    (fiveam:is (string= "GIF header" (hex-detect v)) "hex-detect finds the GIF magic")
+    (fiveam:is (string= "GIF header" (hexv-template-name v)) "and applies it")))
+
+(fiveam:test template-load-from-file
+  (uiop:with-temporary-file (:pathname tp :type "lisp")
+    (with-open-file (s tp :direction :output :if-exists :supersede)
+      (write-string "(\"My fmt\" (:endian :big) (:magic \"MYFT\") (ver :u16))" s))
+    (let ((*templates* (copy-list *templates*)))         ; don't pollute the global registry
+      (fiveam:is (= 1 (load-templates tp)) "one template loaded")
+      (fiveam:is-true (assoc "My fmt" *templates* :test #'string=) "and registered")
+      (fiveam:is (string= "My fmt" (detect-template (%ref-of (map 'vector #'char-code "MYFTxx")) 6 0))
+                 "the loaded template's magic detects it"))))
+
 (fiveam:test template-truncation
   (let ((fs (parse-template '((a :u32)) (%ref-of #(1 2)) 2 0)))   ; only 2 of 4 bytes
     (fiveam:is-false (tf-value (first fs)) "a field running past the end has no value")))

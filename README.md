@@ -71,6 +71,12 @@ length-prefixed record are built in) at the cursor: the field under the cursor i
 and named in the status line, and `Ctrl+Q` lists every parsed field to jump between them.
 (An edit that shifts offsets clears the overlay.)
 
+Templates with a `(:magic …)` option are **auto-detected**: opening a file whose bytes match
+applies the template automatically (the BMP above needs no keypress), and the `Ctrl+D` menu
+has an **(auto-detect)** entry. Your own templates load from disk — put entries (each a
+`("name" …specs…)` form) in `~/.revision-hexdump.templates`, or pick **(load file…)** — so
+you can add formats without touching the source.
+
 **Shift**+movement extends a byte **selection** (highlighted); `Ctrl+C`/`Ctrl+X`/`Ctrl+V`
 copy / cut / paste it through a shared byte clipboard (paste inserts in insert mode,
 overwrites in overwrite mode). `Ctrl+R` **replaces** all occurrences of a pattern (an empty
