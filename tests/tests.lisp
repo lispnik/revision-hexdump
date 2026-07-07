@@ -598,6 +598,34 @@
     (hex-clear-template v)
     (fiveam:is-false (hexv-fields v))))
 
+;;; --- file diff --------------------------------------------------------------
+
+(fiveam:test file-diff
+  (with-temp-file (p2 (%buf #(1 2 99 4 5)))             ; the "other" file (5 bytes)
+    (let ((v (%view #(1 2 3 4 5 6))))                   ; this file (6 bytes) differs at 2 and past 5
+      (hex-diff v p2)
+      (fiveam:is (string= (file-namestring p2) (hexv-diff-name v)))
+      (fiveam:is-false (%diff-at v 0) "byte 0 is the same")
+      (fiveam:is-false (%diff-at v 1) "byte 1 is the same")
+      (fiveam:is-true (%diff-at v 2) "byte 2 differs (3 vs 99)")
+      (fiveam:is-false (%diff-at v 4) "byte 4 is the same")
+      (fiveam:is-true (%diff-at v 5) "byte 5 exists only in this file")
+      (fiveam:is (= 2 (hexv-cursor v)) "opening a diff jumps to the first difference")
+      (%goto v 3) (hex-next-diff v)
+      (fiveam:is (= 5 (hexv-cursor v)) "next-diff finds the byte past the other file's end")
+      (hex-next-diff v)
+      (fiveam:is (= 2 (hexv-cursor v)) "and wraps around to the first difference")
+      (hex-clear-diff v)
+      (fiveam:is-false (hexv-diff v) "clearing releases the diff"))))
+
+(fiveam:test file-diff-identical
+  (with-temp-file (p2 (%buf #(7 8 9)))
+    (let ((v (%view #(7 8 9))))
+      (hex-diff v p2)
+      (fiveam:is (search "identical" (hexv-message v)) "identical files report so")
+      (fiveam:is-false (%scan-diff v 0) "and have no differing byte")
+      (hex-clear-diff v))))
+
 ;;; --- go-to-offset parsing ---------------------------------------------------
 
 (fiveam:test parse-offset

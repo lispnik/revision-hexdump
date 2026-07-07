@@ -32,6 +32,8 @@ Tab toggles the hex/ASCII pane, and it reports unsaved edits so the desktop guar
               (or (and (hexv-message v) (format nil " ~A " (hexv-message v)))   ; transient note takes priority
                   (and sel (format nil " ~D bytes selected · Ctrl-C: copy · Ctrl-X: cut · Ctrl-V: paste · Esc: close "
                                    (1+ (- (cdr sel) (car sel)))))
+                  (let ((dl (hexv-diff-line v)))        ; diffing: show the comparison at the cursor
+                    (and dl (format nil " ~A " dl)))
                   (let ((fl (hexv-field-line v)))       ; a template is applied: show the field at the cursor
                     (and fl (format nil " ~A · Ctrl-Q: fields · Ctrl-D: template " fl)))
                   (format nil " ~:[HEX~;ASCII~]/~A · 0x~X of 0x~X · Ins: mode · Ctrl-F: find · Ctrl-D: template · Ctrl-G: goto · Ctrl-Z: undo · Ctrl-S: save "
@@ -80,8 +82,8 @@ is loaded eagerly)."
     (if (and path (probe-file path))
         (progn (hex-load hv path) (hex-detect hv))  ; auto-apply a template if the magic bytes match
         (setf (hexv-mode hv) :insert))              ; a new, empty buffer starts ready to type
-    ;; OPEN returns a cleanup thunk: close any paged file source when the window closes.
-    (values win hv (lambda (s) (declare (ignore s)) (lambda () (%close-source hv))))))
+    ;; OPEN returns a cleanup thunk: close any paged file source + diff when the window closes.
+    (values win hv (lambda (s) (declare (ignore s)) (lambda () (%close-source hv) (%close-diff hv))))))
 
 (defun run-hexdump (&optional path)
   "Run a hex editor full-screen for PATH (or an empty buffer) until it quits."

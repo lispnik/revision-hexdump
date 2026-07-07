@@ -86,6 +86,18 @@
 
 (defun fs-close (fs) (ignore-errors (close (file-source-stream fs))))
 
+;;; A byte provider for the "other" file in a diff: read (paged if large) + length + closer.
+(defstruct (diff-src (:constructor %diff-src) (:conc-name ds-)) ref length close)
+
+(defun %open-diff-src (path)
+  "Open PATH as a byte provider for diffing (paged when large, in-memory otherwise)."
+  (let ((len (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s))))
+    (if (> len *max-in-memory*)
+        (let ((fs (%make-fs :stream (open path :element-type '(unsigned-byte 8)) :length len)))
+          (%diff-src :ref (lambda (i) (fs-ref fs i)) :length len :close (lambda () (fs-close fs))))
+        (let ((vec (read-file-bytes path)))
+          (%diff-src :ref (lambda (i) (aref vec i)) :length len :close nil)))))
+
 ;;; --- a piece table: editing a large file (incl. insert/delete) without loading it ---
 ;;; The document is a sequence of PIECES, each spanning either the original file
 ;;; (:orig, read through the page cache) or an append-only in-memory ADD buffer.
@@ -207,6 +219,9 @@ A one-entry cache makes the common sequential scan O(1) per byte."
    (fields   :initform nil :accessor hexv-fields         ; a vector of TFIELDs from an applied template, or NIL
              :documentation "The parsed leaf fields (a vector of TFIELDs) of an applied structural template, or NIL.")
    (template-name :initform nil :accessor hexv-template-name)   ; the applied template's name, for display
+   (diff     :initform nil :accessor hexv-diff           ; a DIFF-SRC for the file being compared against, or NIL
+             :documentation "A byte provider for the file this one is being diffed against; NIL when not diffing.")
+   (diff-name :initform nil :accessor hexv-diff-name)    ; the compared file's name, for display
    (bpr      :initform +bpr+ :accessor hexv-bpr          ; bytes per row, chosen from the view width by LAYOUT
              :documentation "Bytes shown per row; LAYOUT sizes it to the view width (a multiple of 8).")
    (big-endian :initform nil :accessor hexv-big-endian  ; data-inspector byte order (NIL = little-endian)
@@ -291,6 +306,7 @@ a smaller one is loaded fully and stays editable."
           (hexv-cursor v) 0 (hexv-top v) 0 (hexv-nibble v) 0 (hexv-anchor v) nil
           (fill-pointer (hexv-history v)) 0 (hexv-hpos v) 0 (hexv-saved-pos v) 0
           (hexv-message v) nil (hexv-fields v) nil (hexv-template-name v) nil))
+  (%close-diff v)                                       ; a fresh file drops any active diff
   (clrhash (hexv-changed v))
   (invalidate v)
   v)
@@ -594,6 +610,62 @@ search (find-next).  Reports the outcome, and never signals."
              (let ((hit (hex-search v pat)))
                (setf (hexv-message v) (if hit (format nil "found at 0x~X" hit) "not found")))))))
     (invalidate v)))
+
+;;; --- file diff --------------------------------------------------------------
+;;; Compare this file against another, byte for byte: differing bytes (and bytes
+;;; past the other file's end) are highlighted, and Ctrl-A jumps to the next one.
+
+(defun %diff-at (v i)
+  "Does byte I of V differ from the compared file (or lie past its end)?"
+  (let ((d (hexv-diff v)))
+    (and d (or (>= i (ds-length d)) (/= (%bref v i) (funcall (ds-ref d) i))))))
+
+(defun %scan-diff (v from)
+  "The first differing offset at or after FROM, wrapping once to the start, or NIL."
+  (let ((n (hexv-length v)))
+    (or (loop for i from from below n when (%diff-at v i) return i)
+        (loop for i from 0 below (min from n) when (%diff-at v i) return i))))
+
+(defun %close-diff (v)
+  (let ((d (hexv-diff v)))
+    (when d (when (ds-close d) (ignore-errors (funcall (ds-close d))))
+          (setf (hexv-diff v) nil (hexv-diff-name v) nil))))
+
+(defun hex-clear-diff (v) (%close-diff v) (invalidate v))
+
+(defun hex-diff (v path)
+  "Compare V against the file at PATH byte for byte, and jump to the first difference."
+  (%close-diff v)
+  (setf (hexv-diff v) (%open-diff-src path) (hexv-diff-name v) (file-namestring path))
+  (let ((hit (%scan-diff v 0)))
+    (if hit (progn (%goto v hit) (setf (hexv-message v) (format nil "diff vs ~a — first at 0x~X" (hexv-diff-name v) hit)))
+        (setf (hexv-message v) (format nil "identical to ~a" (hexv-diff-name v)))))
+  (invalidate v))
+
+(defun hex-next-diff (v)
+  "Jump to the next differing byte (wrapping)."
+  (if (null (hexv-diff v))
+      (setf (hexv-message v) "no diff — Ctrl-O to compare a file")
+      (let ((hit (%scan-diff v (1+ (hexv-cursor v)))))
+        (if hit (progn (%goto v hit) (setf (hexv-message v) (format nil "diff at 0x~X" hit)))
+            (setf (hexv-message v) "no differences"))))
+  (invalidate v))
+
+(defun hex-open-diff (v)
+  "Toggle a diff: clear the current one, or pick a file to compare against."
+  (if (hexv-diff v)
+      (progn (%close-diff v) (setf (hexv-message v) "diff off") (invalidate v))
+      (let ((p (make-file-dialog :dir *project-dir* :title " Compare against ")))
+        (when p (hex-diff v p)))))
+
+(defun hexv-diff-line (v)
+  "A one-line diff status for the cursor, or NIL when not diffing."
+  (when (hexv-diff v)
+    (let ((i (hexv-cursor v)) (d (hexv-diff v)))
+      (if (%diff-at v i)
+          (format nil "diff vs ~a · 0x~2,'0X vs ~A · Ctrl-A: next" (hexv-diff-name v) (%bref v i)
+                  (if (< i (ds-length d)) (format nil "0x~2,'0X" (funcall (ds-ref d) i)) "(past end)"))
+          (format nil "diff vs ~a · same here · Ctrl-A: next" (hexv-diff-name v))))))
 
 (defun hex-toggle-pane (v)
   "Switch between the hex and ASCII edit panes."
@@ -1023,6 +1095,7 @@ edited-but-unsaved byte, or plain."
     (cond ((and cur (eq (hexv-pane v) cur-pane)) (role :focused))
           (cur                                   (role :input-focused))
           ((and sel (<= (car sel) off (cdr sel))) (role :menu-selected))  ; selection
+          ((and (hexv-diff v) (%diff-at v off))  (role :error))           ; differs from the compared file
           ((gethash off (hexv-marks v))          (role :label))           ; bookmark
           ((and fld (<= (car fld) off) (< off (cdr fld))) (role :input))  ; current template field
           ((and (hexv-modified v) (gethash off (hexv-changed v))) (role :error))  ; flagged only while dirty
@@ -1135,6 +1208,8 @@ a middle dot for high bytes) or a plain '.' when control glyphs are off."
       ((%ctrl-char-p ks mods #\p) (hex-next-mark v -1)  (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\d) (hex-prompt-template v) (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\q) (hex-field-list v)    (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\o) (hex-open-diff v)     (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\a) (hex-next-diff v)     (setf (handled-p e) t))
       ;; insert mode: Del removes the byte under the cursor, Bksp the one before it
       ((and (eq (hexv-mode v) :insert) (eql ks :del))
        (%delete-byte v (hexv-cursor v))                 (setf (handled-p e) t))
@@ -1225,6 +1300,8 @@ a middle dot for high bytes) or a plain '.' when control glyphs are off."
     ("Ctrl+N / Ctrl+P" . "jump to the next / previous bookmark")
     ("Ctrl+D"       . "apply a structural template at the cursor")
     ("Ctrl+Q"       . "list the template's fields (jump to one)")
+    ("Ctrl+O"       . "diff against another file (toggle)")
+    ("Ctrl+A"       . "jump to the next difference")
     ("Ctrl+T"       . "show / hide the data inspector")
     ("Ctrl+E"       . "toggle the inspector's byte order (LE/BE)")
     ("Ctrl+B"       . "toggle the offset base (hex / decimal)")

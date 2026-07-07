@@ -69,4 +69,9 @@
    #:*templates*
    #:detect-template
    #:hex-detect
-   #:load-templates))
+   #:load-templates
+   ;; file diff
+   #:hex-diff
+   #:hex-next-diff
+   #:hex-clear-diff
+   #:hexv-diff))

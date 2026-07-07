@@ -33,6 +33,8 @@ classic hex-editor default).
 | `Ctrl+N` `Ctrl+P` | jump to the next / previous bookmark |
 | `Ctrl+D` | apply a **structural template** at the cursor |
 | `Ctrl+Q` | list the template's fields (jump to one) |
+| `Ctrl+O` | **diff** against another file (toggle) |
+| `Ctrl+A` | jump to the next difference |
 | `Ctrl+T` | show / hide the data inspector |
 | `Ctrl+B` | toggle the offset base (hex / decimal) |
 | `Ctrl+U` | toggle control-character glyphs (`␀␁…` vs `.`) |
@@ -76,6 +78,11 @@ applies the template automatically (the BMP above needs no keypress), and the `C
 has an **(auto-detect)** entry. Your own templates load from disk — put entries (each a
 `("name" …specs…)` form) in `~/.revision-hexdump.templates`, or pick **(load file…)** — so
 you can add formats without touching the source.
+
+**File diff.** `Ctrl+O` compares the file against another (a picker; toggle off with `Ctrl+O`
+again): bytes that differ — and bytes past the other file's end — are highlighted, the status
+line shows the two values at the cursor (`0xAA vs 0xBB`), and `Ctrl+A` jumps to the next
+difference (wrapping). The compared file is paged too, so you can diff multi-GB files.
 
 **Shift**+movement extends a byte **selection** (highlighted); `Ctrl+C`/`Ctrl+X`/`Ctrl+V`
 copy / cut / paste it through a shared byte clipboard (paste inserts in insert mode,
