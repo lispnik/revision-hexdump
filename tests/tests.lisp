@@ -128,8 +128,9 @@
 
 (fiveam:test scroll-protocol
   (let ((v (%view (%range 1000))))                      ; 63 rows
-    (fiveam:is (= 20 (scroll-page v)))
-    (fiveam:is (= (max 0 (- (%rows v) 20)) (scroll-max v)))
+    (fiveam:is (= (%page v) (scroll-page v)) "scroll-page is the dump height (minus ruler + inspector)")
+    (fiveam:is (< (%page v) 20) "the ruler and inspector take rows off the 20-row view")
+    (fiveam:is (= (max 0 (- (%rows v) (%page v))) (scroll-max v)) "scroll-max = rows - page")
     (scroll-to v 999) (fiveam:is (= (scroll-max v) (scroll-pos v)) "scroll-to clamps to max")
     (scroll-to v -5)  (fiveam:is (= 0 (scroll-pos v)) "scroll-to clamps to 0")))
 
@@ -422,6 +423,63 @@
         (fiveam:is (string= "0" (cdr (assoc "u8" a :test #'string=))) "the inspector reads a paged source"))
       (%close-source v)
       (fiveam:is-false (hexv-source v) "close releases the source"))))
+
+;;; --- inspector char + binary, and toggles -----------------------------------
+
+(fiveam:test inspector-char-and-binary
+  (let ((v (%view #(#x6C))))                            ; 'l'
+    (flet ((g (k) (cdr (assoc k (hexv-inspect v) :test #'string=))))
+      (fiveam:is (string= "l" (g "char")) "printable byte shows as its character")
+      (fiveam:is (string= "01101100" (g "bin")) "and as 8-bit binary")))
+  (let ((v (%view #(#x00))))                            ; NUL is not printable
+    (fiveam:is (string= "." (cdr (assoc "char" (hexv-inspect v) :test #'string=))) "a control byte's char is a dot")))
+
+(fiveam:test inspector-toggle-changes-page
+  (let ((v (%view (%range 100))))
+    (let ((with (%page v)))
+      (hex-toggle-inspector v)
+      (fiveam:is (= (+ with 2) (%page v)) "hiding the inspector gives its two rows back to the dump")
+      (fiveam:is-false (hexv-inspector v)))))
+
+(fiveam:test control-glyphs
+  (let ((v (%view #(0 9 65 127 200))))
+    (fiveam:is (char= #\A (%ascii-glyph v 65)) "printable is itself")
+    (fiveam:is (char= (code-char #x2400) (%ascii-glyph v 0)) "NUL -> ␀ control picture")
+    (fiveam:is (char= (code-char #x2421) (%ascii-glyph v 127)) "DEL -> ␡")
+    (setf (hexv-ctrl-glyphs v) nil)
+    (fiveam:is (char= #\. (%ascii-glyph v 0)) "with glyphs off, control bytes are '.'")))
+
+(fiveam:test offset-base
+  (let ((v (%view (%range 20))))
+    (fiveam:is (string= "0000000F" (%fmt-offset v 15)) "hex offset by default (15 -> 0F)")
+    (setf (hexv-offset-decimal v) t)
+    (fiveam:is (string= "00000021" (%fmt-offset v 21)) "decimal when toggled (21 -> 21)")))
+
+(fiveam:test read-only-lock
+  (let ((v (%view #(1 2 3))))
+    (fiveam:is-false (hexv-readonly v))
+    (hex-toggle-lock v)
+    (fiveam:is-true (hexv-readonly v) "the lock makes an editable buffer read-only")
+    (%set-byte v 0 #xFF)
+    (fiveam:is (= 1 (%bref v 0)) "and refuses edits")
+    (hex-toggle-lock v)
+    (fiveam:is-false (hexv-readonly v) "unlocking restores editing")))
+
+;;; --- bookmarks --------------------------------------------------------------
+
+(fiveam:test bookmarks
+  (let ((v (%view (%range 100))))
+    (%goto v 10) (hex-toggle-mark v)
+    (%goto v 30) (hex-toggle-mark v)
+    (%goto v 50) (hex-toggle-mark v)
+    (fiveam:is (= 3 (hash-table-count (hexv-marks v))))
+    (%goto v 0)
+    (hex-next-mark v 1)  (fiveam:is (= 10 (hexv-cursor v)) "next mark after 0 is 10")
+    (hex-next-mark v 1)  (fiveam:is (= 30 (hexv-cursor v)))
+    (hex-next-mark v -1) (fiveam:is (= 10 (hexv-cursor v)) "prev mark from 30 is 10")
+    (hex-next-mark v -1) (fiveam:is (= 50 (hexv-cursor v)) "prev wraps to the last mark")
+    (%goto v 30) (hex-toggle-mark v)                     ; clear the mark at 30
+    (fiveam:is (= 2 (hash-table-count (hexv-marks v))) "toggling clears a mark")))
 
 ;;; --- go-to-offset parsing ---------------------------------------------------
 

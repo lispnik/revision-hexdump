@@ -29,6 +29,12 @@ classic hex-editor default).
 | `Insert` | toggle **overwrite ⇄ insert** mode |
 | `Shift`+move | extend the byte **selection** |
 | `Ctrl+C` `Ctrl+X` `Ctrl+V` | copy / cut / paste the selection |
+| `Ctrl+K` | toggle a **bookmark** at the cursor |
+| `Ctrl+N` `Ctrl+P` | jump to the next / previous bookmark |
+| `Ctrl+T` | show / hide the data inspector |
+| `Ctrl+B` | toggle the offset base (hex / decimal) |
+| `Ctrl+U` | toggle control-character glyphs (`␀␁…` vs `.`) |
+| `Ctrl+L` | toggle a read-only lock |
 | `0`–`9` `a`–`f` | edit the byte's high then low nibble (hex pane) |
 | *(printable)* | edit the byte (ASCII pane) |
 | `Bksp` `Del` | delete a byte (insert mode) |
@@ -58,10 +64,13 @@ overwrites in overwrite mode). `Ctrl+R` **replaces** all occurrences of a patter
 replacement deletes them). Multi-byte operations — paste, cut, replace-all — are a single
 undo step.
 
-A **data inspector** under the dump decodes the bytes at the cursor as `u8`/`i8` …
-`u64`/`i64` and `f32`/`f64`, in little- or big-endian (`Ctrl+E` toggles). The dump
-**adapts its width** to the window: a wider window shows 24 or 32 bytes per row (always a
-multiple of 8), a narrow one drops to 8.
+A column **ruler** heads the dump, and a toggleable **data inspector** (`Ctrl+T`) at its
+foot decodes the bytes at the cursor as `u8`/`i8` … `u64`/`i64`, `f32`/`f64`, plus the
+**character** and **binary** of the byte — in little- or big-endian (`Ctrl+E`). The dump
+**adapts its width** to the window (8/16/24/32 bytes per row), shows non-printable bytes as
+Unicode **control pictures** (`Ctrl+U` for plain dots), and the offset column switches
+between **hex and decimal** (`Ctrl+B`). **Bookmarks** (`Ctrl+K`, jump with `Ctrl+N`/`Ctrl+P`)
+mark offsets, and `Ctrl+L` locks a buffer read-only.
 
 **New files & Save-As.** Opening with no path (`run-hexdump`) gives an empty buffer in
 insert mode; type, then `Ctrl+S` prompts for a name (via the framework's `:save` file

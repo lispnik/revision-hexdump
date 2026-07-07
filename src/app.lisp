@@ -37,16 +37,8 @@ Tab toggles the hex/ASCII pane, and it reports unsaved edits so the desktop guar
                           (cond ((hexv-readonly v) "RO") ((eq (hexv-mode v) :insert) "INS") (t "OVR"))
                           (hexv-cursor v) (hexv-length v))))))))
 
-(defun %hx-inspect (w)
-  "Refresh the two data-inspector lines from the cursor."
-  (let ((v (%hx-view w)) (i1 (find-view w 'insp1)) (i2 (find-view w 'insp2)))
-    (when (and v i1 i2)
-      (destructuring-bind (l1 l2) (hexv-inspect-lines v)
-        (setf (static-text-text i1) (format nil " ~A " l1)
-              (static-text-text i2) (format nil " ~A " l2))))))
-
-(defmethod draw :before ((w hex-window))    ; keep the chrome live each repaint
-  (%hx-inspect w) (%hx-status w) (%hx-title w))
+(defmethod draw :before ((w hex-window))    ; keep the title / status live each repaint
+  (%hx-status w) (%hx-title w))              ; the data inspector is drawn inside the hex-view
 
 ;; Unsaved edits: Esc must not silently discard the buffer, and closing a modified
 ;; one prompts to save (the desktop's %DT-REQUEST-CLOSE consults these).
@@ -78,12 +70,8 @@ is loaded eagerly)."
   (let* ((win  (make-instance 'hex-window :title " hexdump " :keymap *global-keys*))
          (body (make-instance 'stack))
          (hv   (make-instance 'hex-view :name 'hex))
-         (i1   (make-instance 'static-text :name 'insp1 :role :label :text ""))
-         (i2   (make-instance 'static-text :name 'insp2 :role :label :text ""))
          (st   (make-instance 'static-text :name 'status :role :status :text "")))
     (add-laid body hv :fill)
-    (add-laid body i1 1)                        ; data inspector (2 lines)
-    (add-laid body i2 1)
     (add-laid body st 1)
     (add-subview win body)
     (setf (window-scroll-target win) hv (window-help win) :hexdump)

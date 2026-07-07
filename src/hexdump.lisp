@@ -101,6 +101,16 @@
              :documentation "The active edit pane, :HEX or :ASCII (Tab toggles).")
    (mode     :initform :overwrite :accessor hexv-mode   ; :overwrite | :insert (Ins toggles)
              :documentation "Editing mode: :OVERWRITE keeps the file size; :INSERT lets typing insert bytes and Bksp/Del remove them.")
+   (inspector :initform t :accessor hexv-inspector       ; data inspector shown at the foot of the view? (Ctrl-T)
+             :documentation "Show the data-inspector panel (2 lines) inside the view?  Ctrl-T toggles.")
+   (offset-decimal :initform nil :accessor hexv-offset-decimal  ; offset column in decimal? (Ctrl-B)
+             :documentation "Show offsets in decimal instead of hex (Ctrl-B toggles).")
+   (locked   :initform nil :accessor hexv-locked          ; a user read-only lock on an editable buffer (Ctrl-L)
+             :documentation "A read-only lock on an otherwise-editable buffer (Ctrl-L); large files are always read-only.")
+   (ctrl-glyphs :initform t :accessor hexv-ctrl-glyphs    ; render control bytes as Unicode pictures?
+             :documentation "Render control bytes as Unicode control pictures (␀␁…␡) rather than '.' (Ctrl-P toggles).")
+   (marks    :initform (make-hash-table) :accessor hexv-marks    ; bookmarked offsets (a set)
+             :documentation "Bookmarked offsets: Ctrl-K toggles one at the cursor, Ctrl-N/Ctrl-P jump between them.")
    (bpr      :initform +bpr+ :accessor hexv-bpr          ; bytes per row, chosen from the view width by LAYOUT
              :documentation "Bytes shown per row; LAYOUT sizes it to the view width (a multiple of 8).")
    (big-endian :initform nil :accessor hexv-big-endian  ; data-inspector byte order (NIL = little-endian)
@@ -139,7 +149,8 @@ in view (a width change moves rows around)."
 
 (defun hexv-length (v)
   (let ((src (hexv-source v))) (if src (file-source-length src) (length (hexv-bytes v)))))
-(defun hexv-readonly (v) (and (hexv-source v) t))       ; a paged large file is view-only
+(defun hexv-readonly (v)                                ; a paged large file, or a user lock
+  (or (and (hexv-source v) t) (hexv-locked v)))
 (declaim (inline %bref))
 (defun %bref (v i)
   "Byte I of V, whether it is an in-memory buffer or a paged file source."
@@ -147,7 +158,10 @@ in view (a width change moves rows around)."
 (defun %close-source (v)
   "Close V's paged file source, if any."
   (when (hexv-source v) (fs-close (hexv-source v)) (setf (hexv-source v) nil)))
-(defun %page (v) (max 1 (rect-height (view-bounds v))))
+(defun %ruler-rows (v) (declare (ignore v)) 1)          ; the column-header row at the top
+(defun %inspector-rows (v) (if (hexv-inspector v) 2 0)) ; the data inspector at the foot
+(defun %page (v)                                        ; scrollable dump rows (minus the chrome)
+  (max 1 (- (rect-height (view-bounds v)) (%ruler-rows v) (%inspector-rows v))))
 ;; +1 so a cursor at the append position (offset = length, valid in insert mode) has a row.
 (defun %rows (v) (max 1 (ceiling (1+ (hexv-length v)) (hexv-bpr v))))
 (defun %max-cursor (v)
@@ -498,22 +512,25 @@ buffer end shows as \"—\"."
            (fmtf (x) (cond ((null x) "—")
                            ((> (abs x) 1d16) (format nil "~,4E" x))
                            (t (format nil "~,6G" x)))))
-      (list (cons "u8"  (fmt (u 1)))            (cons "i8"  (fmt (%to-signed (u 1) 8)))
-            (cons "u16" (fmt (u 2)))            (cons "i16" (fmt (%to-signed (u 2) 16)))
-            (cons "u32" (fmt (u 4)))            (cons "i32" (fmt (%to-signed (u 4) 32)))
-            (cons "u64" (fmt (u 8)))            (cons "i64" (fmt (%to-signed (u 8) 64)))
-            (cons "f32" (fmtf (%read-f32 v off be)))
-            (cons "f64" (fmtf (%read-f64 v off be)))))))
+      (let ((b8 (u 1)))
+        (list (cons "u8"  (fmt b8))                  (cons "i8"  (fmt (%to-signed b8 8)))
+              (cons "char" (cond ((null b8) "—") ((<= 32 b8 126) (string (code-char b8))) (t ".")))
+              (cons "bin" (if b8 (format nil "~8,'0B" b8) "—"))
+              (cons "u16" (fmt (u 2)))               (cons "i16" (fmt (%to-signed (u 2) 16)))
+              (cons "u32" (fmt (u 4)))               (cons "i32" (fmt (%to-signed (u 4) 32)))
+              (cons "u64" (fmt (u 8)))               (cons "i64" (fmt (%to-signed (u 8) 64)))
+              (cons "f32" (fmtf (%read-f32 v off be)))
+              (cons "f64" (fmtf (%read-f64 v off be))))))))
 
 (defun hexv-inspect-lines (v)
-  "Two compact inspector lines (unsigned+f32 on top, signed+f64 below), prefixed LE/BE."
+  "Two compact inspector lines for the byte(s) at the cursor, prefixed with the byte order."
   (let ((a (hexv-inspect v)) (be (if (hexv-big-endian v) "BE" "LE")))
     (flet ((g (k) (cdr (assoc k a :test #'string=))))
       (list
-       (format nil "~a  u8 ~a  u16 ~a  u32 ~a  u64 ~a  f32 ~a"
-               be (g "u8") (g "u16") (g "u32") (g "u64") (g "f32"))
-       (format nil "    i8 ~a  i16 ~a  i32 ~a  i64 ~a  f64 ~a"
-               (g "i8") (g "i16") (g "i32") (g "i64") (g "f64"))))))
+       (format nil "~a  u8 ~a  i8 ~a  '~a' ~a   u16 ~a  i16 ~a"
+               be (g "u8") (g "i8") (g "char") (g "bin") (g "u16") (g "i16"))
+       (format nil "    u32 ~a  i32 ~a  u64 ~a  i64 ~a  f32 ~a  f64 ~a"
+               (g "u32") (g "i32") (g "u64") (g "i64") (g "f32") (g "f64"))))))
 
 (defun hex-toggle-endian (v)
   "Toggle the data inspector between little- and big-endian."
@@ -634,43 +651,72 @@ count.  An empty replacement deletes the matches."
 ;;; --- drawing ----------------------------------------------------------------
 
 (defun %cell-attr (v off cur-pane sel)
-  "Colour for byte OFF in the pane CUR-PANE: the cursor cell in the active pane, a selected
-byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
+  "Colour for byte OFF in the pane CUR-PANE: cursor cell, selection (SEL is (LO . HI) or
+NIL), a bookmark, an edited-but-unsaved byte, or plain."
   (let ((cur (= off (hexv-cursor v))))
     (cond ((and cur (eq (hexv-pane v) cur-pane)) (role :focused))
           (cur                                   (role :input-focused))
           ((and sel (<= (car sel) off (cdr sel))) (role :menu-selected))  ; selection
+          ((gethash off (hexv-marks v))          (role :label))           ; bookmark
           ((and (hexv-modified v) (gethash off (hexv-changed v))) (role :error))  ; flagged only while dirty
           (t                                     (role :normal)))))
+
+(defun %ascii-glyph (v byte)
+  "The ASCII-gutter character for BYTE: the printable char, else a control picture (␀..␡,
+a middle dot for high bytes) or a plain '.' when control glyphs are off."
+  (cond ((<= 32 byte 126)         (code-char byte))
+        ((not (hexv-ctrl-glyphs v)) #\.)
+        ((< byte 32)              (code-char (+ #x2400 byte)))   ; ␀ .. ␟
+        ((= byte 127)             (code-char #x2421))            ; ␡
+        (t                        (code-char #xB7))))            ; · for 128..255
+
+(defun %fmt-offset (v off)
+  (if (hexv-offset-decimal v) (format nil "~8,'0D" off) (format nil "~8,'0X" off)))
+
+(defun %draw-ruler (v bpr w)
+  "Draw the column-header row: the byte-column indices over the hex + ASCII panes."
+  (let ((attr (role :frame-inactive)))
+    (fill-row v 0 0 w attr)
+    (draw-text v 0 0 (if (hexv-offset-decimal v) " (dec)  " " (hex)  ") attr)
+    (dotimes (i bpr)
+      (draw-text v (%hex-col i) 0 (format nil "~2,'0X" i) attr)
+      (draw-text v (%ascii-col bpr i) 0 (string (digit-char (mod i 16) 16)) attr))))
+
+(defun %draw-inspector (v h w)
+  (when (hexv-inspector v)
+    (loop for line in (hexv-inspect-lines v) for r from (- h 2)
+          do (fill-row v 0 r w (role :normal))
+             (draw-text v 1 r line (role :label)))))
 
 (defmethod draw ((v hex-view))
   (let* ((b (view-bounds v)) (w (rect-width b)) (h (rect-height b))
          (ax (rect-ax b)) (ay (rect-ay b)) (bpr (hexv-bpr v))
-         (n (hexv-length v)) (top (hexv-top v)) (sel (hexv-selection v)))
-    (dotimes (r h)
-      (fill-row v 0 r w (role :normal))
-      (let ((base (* (+ top r) bpr)))
-        (when (< base (max 1 n))                        ; an empty file still shows its offset row
-          (draw-text v 0 r (format nil "~8,'0X" base) (role :label))
+         (n (hexv-length v)) (top (hexv-top v)) (sel (hexv-selection v))
+         (page (%page v)))
+    (dotimes (r h) (fill-row v 0 r w (role :normal)))
+    (%draw-ruler v bpr w)                                ; row 0
+    (dotimes (dr page)                                   ; dump rows 1 .. page
+      (let ((sr (1+ dr)) (base (* (+ top dr) bpr)))
+        (when (< base (max 1 n))                         ; an empty file still shows its offset row
+          (draw-text v 0 sr (%fmt-offset v base) (role :label))
           (dotimes (i bpr)
             (let ((off (+ base i)))
               (when (< off n)
                 (let ((byte (%bref v off)))
-                  (draw-text v (%hex-col i) r (format nil "~2,'0X" byte) (%cell-attr v off :hex sel))
-                  (draw-text v (%ascii-col bpr i) r
-                             (string (if (<= 32 byte 126) (code-char byte) #\.))
+                  (draw-text v (%hex-col i) sr (format nil "~2,'0X" byte) (%cell-attr v off :hex sel))
+                  (draw-text v (%ascii-col bpr i) sr (string (%ascii-glyph v byte))
                              (%cell-attr v off :ascii sel)))))))))
+    (%draw-inspector v h w)                              ; foot
     ;; a real block cursor in the active pane (only when focused); in insert mode it can
     ;; sit at the append position (offset = length), including an empty buffer.
     (when (and (view-focused-p v) *screen* (or (plusp n) (eq (hexv-mode v) :insert)))
-      (let* ((bpr (hexv-bpr v)) (off (hexv-cursor v))
-             (row (- (floor off bpr) top)) (col (mod off bpr)))
-        (when (<= 0 row (1- h))
+      (let* ((off (hexv-cursor v)) (dr (- (floor off bpr) top)) (col (mod off bpr)))
+        (when (<= 0 dr (1- page))                        ; cursor within the visible dump
           (let ((cx (if (eq (hexv-pane v) :hex)
                         (+ (%hex-col col) (hexv-nibble v))
                         (%ascii-col bpr col))))
             (when (< cx w)
-              (set-cursor-pos *screen* (+ ax cx) (+ ay row))
+              (set-cursor-pos *screen* (+ ax cx) (+ ay (1+ dr)))
               (set-cursor-shape :block)
               (show-cursor *screen*))))))))
 
@@ -711,6 +757,13 @@ byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
       ((%ctrl-char-p ks mods #\c) (hex-copy v)          (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\x) (hex-cut v)           (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\v) (hex-paste v)         (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\t) (hex-toggle-inspector v)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\b) (hex-toggle-offset-base v) (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\u) (hex-toggle-ctrl-glyphs v) (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\l) (hex-toggle-lock v)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\k) (hex-toggle-mark v)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\n) (hex-next-mark v 1)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\p) (hex-next-mark v -1)  (setf (handled-p e) t))
       ;; insert mode: Del removes the byte under the cursor, Bksp the one before it
       ((and (eq (hexv-mode v) :insert) (eql ks :del))
        (%delete-byte v (hexv-cursor v))                 (setf (handled-p e) t))
@@ -726,13 +779,55 @@ byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
       (t (call-next-method)))))                         ; Tab (pane, at the window), Esc/q bubble
 
 (defmethod handle-event ((v hex-view) (e mouse-down))
-  (let ((base (* (+ (hexv-top v) (mouse-row v e)) (hexv-bpr v))))
-    (multiple-value-bind (pane i) (%col->byte (hexv-bpr v) (mouse-col v e))
-      (when (and pane (< (+ base i) (hexv-length v)))
-        (setf (hexv-pane v) pane (hexv-cursor v) (+ base i) (hexv-nibble v) 0
-              (hexv-anchor v) nil)                       ; a click collapses any selection
-        (invalidate v))))
+  (let ((sr (mouse-row v e)))
+    (when (plusp sr)                                     ; row 0 is the ruler
+      (let ((base (* (+ (hexv-top v) (1- sr)) (hexv-bpr v))))
+        (multiple-value-bind (pane i) (%col->byte (hexv-bpr v) (mouse-col v e))
+          (when (and pane (< (+ base i) (hexv-length v)))
+            (setf (hexv-pane v) pane (hexv-cursor v) (+ base i) (hexv-nibble v) 0
+                  (hexv-anchor v) nil)                   ; a click collapses any selection
+            (invalidate v))))))
   (setf (handled-p e) t))
+
+;;; --- view toggles + bookmarks -----------------------------------------------
+
+(defun hex-toggle-inspector (v)
+  "Show / hide the data-inspector panel (reclaiming its two rows for the dump)."
+  (setf (hexv-inspector v) (not (hexv-inspector v)))
+  (%ensure-visible v) (invalidate v))
+(defun hex-toggle-offset-base (v)
+  (setf (hexv-offset-decimal v) (not (hexv-offset-decimal v))) (invalidate v))
+(defun hex-toggle-ctrl-glyphs (v)
+  (setf (hexv-ctrl-glyphs v) (not (hexv-ctrl-glyphs v))) (invalidate v))
+(defun hex-toggle-lock (v)
+  "Toggle a read-only lock (no effect on an already-read-only large file)."
+  (if (hexv-source v)
+      (setf (hexv-message v) "already read-only (large file)")
+      (setf (hexv-locked v) (not (hexv-locked v))
+            (hexv-message v) (if (hexv-locked v) "read-only lock ON" "read-only lock OFF")))
+  (invalidate v))
+
+(defun hex-toggle-mark (v)
+  "Toggle a bookmark at the cursor."
+  (let ((off (hexv-cursor v)))
+    (cond ((gethash off (hexv-marks v))
+           (remhash off (hexv-marks v)) (setf (hexv-message v) (format nil "mark cleared at 0x~X" off)))
+          (t (setf (gethash off (hexv-marks v)) t) (setf (hexv-message v) (format nil "mark set at 0x~X" off))))
+    (invalidate v)))
+
+(defun %sorted-marks (v) (sort (loop for k being the hash-keys of (hexv-marks v) collect k) #'<))
+
+(defun hex-next-mark (v &optional (dir 1))
+  "Jump to the next (DIR 1) or previous (DIR -1) bookmark, wrapping around."
+  (let ((marks (%sorted-marks v)) (cur (hexv-cursor v)))
+    (if (null marks)
+        (setf (hexv-message v) "no bookmarks — Ctrl-K sets one")
+        (let ((target (if (plusp dir)
+                          (or (find-if (lambda (m) (> m cur)) marks) (first marks))
+                          (or (find-if (lambda (m) (< m cur)) (reverse marks)) (car (last marks))))))
+          (%goto v target)
+          (setf (hexv-message v) (format nil "mark 0x~X (~D total)" target (length marks)))))
+    (invalidate v)))
 
 (defmethod handle-event ((v hex-view) (e wheel-event))
   (scroll-to v (+ (hexv-top v) (* 3 (event-delta e))))
@@ -755,7 +850,13 @@ byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
     ("Ctrl+F"       . "find hex bytes or /text (empty = find next)")
     ("Ctrl+R"       . "replace all (hex or /text)")
     ("Ctrl+G"       . "go to a hex offset")
-    ("Ctrl+E"       . "toggle the data inspector's byte order (LE/BE)")
+    ("Ctrl+K"       . "toggle a bookmark at the cursor")
+    ("Ctrl+N / Ctrl+P" . "jump to the next / previous bookmark")
+    ("Ctrl+T"       . "show / hide the data inspector")
+    ("Ctrl+E"       . "toggle the inspector's byte order (LE/BE)")
+    ("Ctrl+B"       . "toggle the offset base (hex / decimal)")
+    ("Ctrl+U"       . "toggle control-character glyphs")
+    ("Ctrl+L"       . "toggle a read-only lock")
     ("Ctrl+Z / Ctrl+Y" . "undo / redo")
     ("Ctrl+S"       . "save (prompts for a name when the buffer is new)")
     ("Ctrl+W"       . "save as… (choose a new file)")))

@@ -50,4 +50,14 @@
    #:hexv-cursor
    #:hexv-pane
    #:hexv-modified
-   #:hexv-filename))
+   #:hexv-filename
+   ;; view options + bookmarks
+   #:hexv-inspector
+   #:hexv-offset-decimal
+   #:hexv-ctrl-glyphs
+   #:hexv-locked
+   #:hexv-marks
+   #:hex-toggle-inspector
+   #:hex-toggle-lock
+   #:hex-toggle-mark
+   #:hex-next-mark))
