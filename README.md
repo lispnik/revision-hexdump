@@ -77,10 +77,12 @@ insert mode; type, then `Ctrl+S` prompts for a name (via the framework's `:save`
 dialog, which confirms overwrites). `Ctrl+W` is Save-As for an existing buffer.
 
 **Large files.** A file over `*max-in-memory*` (default 64 MB) is **not loaded into RAM** —
-it opens **read-only**, read one page at a time on demand through a bounded cache, so a
-multi-GB file can be viewed, navigated, searched, and inspected without OOM. (In-place
-*editing* of huge files would need a piece table and is out of scope; small files stay
-fully editable.)
+it is read one page at a time on demand through a bounded cache, so a multi-GB file can be
+viewed, navigated, searched, and inspected without OOM. It is also **editable in place**:
+overwrite edits are kept in a sparse overlay and, on save, streamed back to disk (via a
+temp file + rename) — again without loading the whole file. The file keeps its size, so
+**insert/delete are disabled** for a paged file (shifting a multi-GB tail would need a piece
+table); a file loaded in memory has no such limit.
 
 ## As a desktop window
 

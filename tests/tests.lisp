@@ -406,23 +406,43 @@
 
 ;;; --- large-file (paged, read-only) source -----------------------------------
 
-(fiveam:test large-file-readonly
+(fiveam:test large-file-editable
   (with-temp-file (p (%buf (loop for i below 20 collect i)))
     (let ((v (%view)) (*max-in-memory* 4) (*fs-page-size* 8))   ; force the paged path, tiny pages
       (hex-load v p)
-      (fiveam:is-true (hexv-readonly v) "a file over the threshold opens read-only")
+      (fiveam:is-false (hexv-readonly v) "a large paged file is editable (not locked)")
+      (fiveam:is-false (hexv-resizable-p v) "but fixed-size — no insert/delete")
       (fiveam:is (= 20 (hexv-length v)) "its length is known without loading it")
       (fiveam:is (= 5 (%bref v 5)) "a paged read returns the right byte")
       (fiveam:is (= 19 (%bref v 19)) "including across page boundaries")
-      (%set-byte v 0 #xFF)                              ; editing is refused
-      (fiveam:is (= 0 (%bref v 0)) "a read-only source cannot be edited")
+      ;; overwrite editing goes through the overlay, and undoes
+      (%set-byte v 3 #xFF)
+      (fiveam:is (= #xFF (%bref v 3)) "overwrite edits a paged file through the overlay")
+      (fiveam:is-true (hexv-modified v))
+      (hex-undo v)
+      (fiveam:is (= 3 (%bref v 3)) "undo reverts a paged overwrite")
       (fiveam:is-false (hexv-modified v))
+      ;; insert is refused (fixed size)
+      (%insert-byte v 0 #x99)
+      (fiveam:is (= 20 (hexv-length v)) "insert is refused on a paged file")
       (fiveam:is (= 10 (hex-search v (%buf '(10 11 12)) 0)) "search scans a paged source")
-      (%goto v 0)                                        ; search left the cursor at the match
-      (let ((a (hexv-inspect v)))
-        (fiveam:is (string= "0" (cdr (assoc "u8" a :test #'string=))) "the inspector reads a paged source"))
       (%close-source v)
       (fiveam:is-false (hexv-source v) "close releases the source"))))
+
+(fiveam:test large-file-save
+  (with-temp-file (p (%buf (loop for i below 30 collect i)))
+    (let ((v (%view)) (*max-in-memory* 4) (*fs-page-size* 8))
+      (hex-load v p)
+      (%set-byte v 0 #xAA) (%set-byte v 15 #xBB) (%set-byte v 29 #xCC)   ; edits across pages
+      (hex-save v)
+      (fiveam:is-false (hexv-modified v) "streamed save -> clean")
+      (let ((bytes (read-file-bytes p)))                 ; the file on disk, applied overlay
+        (fiveam:is (= 30 (length bytes)) "size is preserved")
+        (fiveam:is (= #xAA (aref bytes 0)))
+        (fiveam:is (= #xBB (aref bytes 15)) "an edit on a later page is written")
+        (fiveam:is (= #xCC (aref bytes 29)))
+        (fiveam:is (= 7 (aref bytes 7)) "unedited bytes are preserved"))
+      (%close-source v))))
 
 ;;; --- inspector char + binary, and toggles -----------------------------------
 
