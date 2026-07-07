@@ -55,6 +55,38 @@
     (write-sequence bytes s))
   path)
 
+;;; --- a paged, read-only source for large files ------------------------------
+;;; A file over *MAX-IN-MEMORY* is not slurped into RAM; instead it is read one
+;;; page at a time, on demand, through a bounded page cache -- so a multi-GB file
+;;; can be viewed / navigated / searched without loading it.  Such a buffer is
+;;; read-only (editing a huge file in place would need a piece table); small files
+;;; are still loaded fully and stay editable.
+
+(defparameter *max-in-memory* (* 64 1024 1024)
+  "Files larger than this (bytes) open read-only and paged, rather than loaded into RAM.")
+(defparameter *fs-page-size* 65536 "Bytes read per page for a paged file source.")
+(defparameter *fs-max-cache-pages* 256 "Cached pages before the cache is dropped (bounds memory).")
+
+(defstruct (file-source (:constructor %make-fs) (:copier nil))
+  stream length (page-size *fs-page-size*) (cache (make-hash-table)))
+
+(defun %fs-read-page (fs pg)
+  (let* ((ps (file-source-page-size fs)) (start (* pg ps))
+         (n (max 0 (min ps (- (file-source-length fs) start))))
+         (buf (make-array n :element-type '(unsigned-byte 8))))
+    (file-position (file-source-stream fs) start)
+    (read-sequence buf (file-source-stream fs))
+    buf))
+
+(defun fs-ref (fs i)
+  "Byte I of the file, read through the page cache."
+  (let* ((ps (file-source-page-size fs)) (pg (floor i ps)) (cache (file-source-cache fs)))
+    (when (> (hash-table-count cache) *fs-max-cache-pages*) (clrhash cache))   ; bound memory
+    (aref (or (gethash pg cache) (setf (gethash pg cache) (%fs-read-page fs pg)))
+          (mod i ps))))
+
+(defun fs-close (fs) (ignore-errors (close (file-source-stream fs))))
+
 ;;; --- the view ---------------------------------------------------------------
 
 (defclass hex-view (view)
@@ -75,6 +107,8 @@
              :documentation "Byte order the data inspector decodes with (NIL little-endian; Ctrl-E toggles).")
    (anchor   :initform nil :accessor hexv-anchor         ; selection anchor offset (NIL = no selection)
              :documentation "The offset where a Shift-extended selection began, or NIL when nothing is selected.")
+   (source   :initform nil :accessor hexv-source          ; a FILE-SOURCE for a large read-only file, else NIL
+             :documentation "A paged FILE-SOURCE when a large file is open read-only; NIL for an in-memory buffer.")
    (last-search :initform nil :accessor hexv-last-search)  ; the last search pattern (byte vector), for find-next
    (changed  :initform (make-hash-table) :accessor hexv-changed)  ; offset -> T, touched since load/save (highlight)
    (history  :initform (make-array 0 :adjustable t :fill-pointer 0) :accessor hexv-history
@@ -103,7 +137,16 @@ in view (a width change moves rows around)."
   (setf (hexv-top v) (min (hexv-top v) (scroll-max v)))
   (%ensure-visible v))
 
-(defun hexv-length (v) (length (hexv-bytes v)))
+(defun hexv-length (v)
+  (let ((src (hexv-source v))) (if src (file-source-length src) (length (hexv-bytes v)))))
+(defun hexv-readonly (v) (and (hexv-source v) t))       ; a paged large file is view-only
+(declaim (inline %bref))
+(defun %bref (v i)
+  "Byte I of V, whether it is an in-memory buffer or a paged file source."
+  (let ((src (hexv-source v))) (if src (fs-ref src i) (aref (hexv-bytes v) i))))
+(defun %close-source (v)
+  "Close V's paged file source, if any."
+  (when (hexv-source v) (fs-close (hexv-source v)) (setf (hexv-source v) nil)))
 (defun %page (v) (max 1 (rect-height (view-bounds v))))
 ;; +1 so a cursor at the append position (offset = length, valid in insert mode) has a row.
 (defun %rows (v) (max 1 (ceiling (1+ (hexv-length v)) (hexv-bpr v))))
@@ -121,12 +164,20 @@ has moved off the clean checkpoint (see HEXV-SAVED-POS)."
 ;;; --- load / save ------------------------------------------------------------
 
 (defun hex-load (v path)
-  "Load PATH's bytes into V, resetting the cursor and the whole edit history."
-  (setf (hexv-bytes v) (read-file-bytes path)
-        (hexv-filename v) path
-        (hexv-cursor v) 0 (hexv-top v) 0 (hexv-nibble v) 0
-        (fill-pointer (hexv-history v)) 0 (hexv-hpos v) 0 (hexv-saved-pos v) 0
-        (hexv-message v) nil)
+  "Load PATH into V, resetting the cursor and edit history.  A file larger than
+*MAX-IN-MEMORY* opens read-only through a paged FILE-SOURCE (not slurped into RAM);
+a smaller one is loaded fully and stays editable."
+  (%close-source v)
+  (let ((len (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s))))
+    (if (> len *max-in-memory*)
+        (setf (hexv-source v) (%make-fs :stream (open path :element-type '(unsigned-byte 8)) :length len)
+              (hexv-bytes v) (%make-buf 0))
+        (setf (hexv-source v) nil
+              (hexv-bytes v) (read-file-bytes path)))
+    (setf (hexv-filename v) path
+          (hexv-cursor v) 0 (hexv-top v) 0 (hexv-nibble v) 0 (hexv-anchor v) nil
+          (fill-pointer (hexv-history v)) 0 (hexv-hpos v) 0 (hexv-saved-pos v) 0
+          (hexv-message v) nil))
   (clrhash (hexv-changed v))
   (invalidate v)
   v)
@@ -233,23 +284,30 @@ drop the offset-keyed change highlights; run the on-change hook; repaint."
   (when (hexv-on-change v) (funcall (hexv-on-change v) v))
   (invalidate v))
 
+(defun %readonly-blocked (v)
+  "True (with a status note) when V is a read-only large file, so an edit is refused."
+  (and (hexv-readonly v)
+       (progn (setf (hexv-message v) "read-only — large file (view only)") (invalidate v) t)))
+
 (defun %set-byte (v off value)
   "Overwrite byte OFF with VALUE (0-255), logging an undo step.  A no-op write does nothing."
-  (let ((old (aref (hexv-bytes v) off)) (new (logand value #xff)))
-    (unless (= old new)
-      (%push-edit v (list :set off old new))
-      (setf (aref (hexv-bytes v) off) new (gethash off (hexv-changed v)) t)
-      (%after-edit v))))
+  (unless (hexv-readonly v)
+    (let ((old (aref (hexv-bytes v) off)) (new (logand value #xff)))
+      (unless (= old new)
+        (%push-edit v (list :set off old new))
+        (setf (aref (hexv-bytes v) off) new (gethash off (hexv-changed v)) t)
+        (%after-edit v)))))
 
 (defun %insert-byte (v off value)
   "Insert VALUE at OFF (insert mode), logging an undo step."
-  (%push-edit v (list :ins off (logand value #xff)))
-  (%buf-insert v off value)
-  (%after-edit v t))
+  (unless (hexv-readonly v)
+    (%push-edit v (list :ins off (logand value #xff)))
+    (%buf-insert v off value)
+    (%after-edit v t)))
 
 (defun %delete-byte (v off)
   "Delete the byte at OFF (if any), logging an undo step, and keep the cursor in range."
-  (when (< off (hexv-length v))
+  (when (and (not (hexv-readonly v)) (< off (hexv-length v)))
     (%push-edit v (list :del off (aref (hexv-bytes v) off)))
     (%buf-delete v off)
     (setf (hexv-cursor v) (min (hexv-cursor v) (%max-cursor v)))
@@ -300,10 +358,32 @@ drop the offset-keyed change highlights; run the on-change hook; repaint."
         (if off (%goto v off) (setf (hexv-message v) "invalid offset"))))
     (invalidate v)))
 
+(defun %hx-say-saved (v path err)
+  "Record the outcome of a save as V's status note."
+  (setf (hexv-message v)
+        (cond (path (format nil "saved ~D byte~:P to ~A" (hexv-length v) (file-namestring path)))
+              (err  (format nil "save failed: ~A" err))
+              (t    "save cancelled"))))
+
+(defun hex-prompt-save-as (v)
+  "Prompt for a destination with the framework's :save file dialog (which confirms an
+overwrite) and save V there.  This is how a new, unnamed buffer gets its file."
+  (when (%readonly-blocked v) (return-from hex-prompt-save-as))
+  (let ((p (make-file-dialog :mode :save
+                             :dir (if (hexv-filename v)
+                                      (uiop:pathname-directory-pathname (hexv-filename v))
+                                      *project-dir*)
+                             :default-name (if (hexv-filename v)
+                                               (file-namestring (hexv-filename v))
+                                               "untitled.bin"))))
+    (when p (multiple-value-call #'%hx-say-saved v (hex-save v p)))
+    (invalidate v)))
+
 (defun %hex-input (v digit)
   "Apply hex DIGIT (0-15) to the byte under the cursor.  Overwrite mode edits the current
 byte's active nibble; insert mode's first nibble inserts a new byte (DIGIT as its high
 nibble), the second finishes it.  Either way the low nibble advances the cursor."
+  (when (%readonly-blocked v) (return-from %hex-input))
   (if (eq (hexv-mode v) :insert)
       (if (zerop (hexv-nibble v))
           (progn (%insert-byte v (hexv-cursor v) (ash digit 4))   ; new byte, high nibble
@@ -322,6 +402,7 @@ nibble), the second finishes it.  Either way the low nibble advances the cursor.
 (defun %ascii-input (v char)
   "Insert (insert mode) or overwrite (overwrite mode) the current byte with CHAR's code,
 then advance the cursor."
+  (when (%readonly-blocked v) (return-from %ascii-input))
   (cond
     ((eq (hexv-mode v) :insert) (%insert-byte v (hexv-cursor v) (char-code char)) (%move v 1))
     ((plusp (hexv-length v))    (%set-byte v (hexv-cursor v) (char-code char)) (%move v 1))))
@@ -342,20 +423,20 @@ otherwise it is hex bytes (spaces optional, even number of digits).  NIL if unpa
                  do (setf (aref out i) (parse-integer h :start (* i 2) :end (+ 2 (* i 2)) :radix 16))
                  finally (return out)))))))
 
-(defun %find-bytes (buf pattern start)
-  "The first index >= START where PATTERN occurs in BUF, or NIL (no wrap)."
-  (let ((n (length buf)) (m (length pattern)))
+(defun %find-bytes (v pattern start)
+  "The first index >= START where PATTERN occurs in V's bytes, or NIL (no wrap).  Reads
+through %BREF, so it scans an in-memory buffer or a paged file source alike."
+  (let ((n (hexv-length v)) (m (length pattern)))
     (when (plusp m)
       (loop for i from (max 0 start) to (- n m)
-            when (loop for j below m always (= (aref buf (+ i j)) (aref pattern j)))
+            when (loop for j below m always (= (%bref v (+ i j)) (aref pattern j)))
               return i))))
 
 (defun hex-search (v pattern &optional (from (1+ (hexv-cursor v))))
   "Move the cursor to the next occurrence of PATTERN (an octet vector) at or after FROM,
 wrapping once to the start.  Returns the offset, or NIL when there is no match."
-  (let* ((buf (hexv-bytes v))
-         (hit (or (%find-bytes buf pattern from)
-                  (%find-bytes buf pattern 0))))          ; wrap
+  (let ((hit (or (%find-bytes v pattern from)
+                 (%find-bytes v pattern 0))))            ; wrap
     (when hit (%goto v hit))
     hit))
 
@@ -385,25 +466,25 @@ search (find-next).  Reports the outcome, and never signals."
 ;;; view's current byte order.  A hosting window shows these; the decoding is here
 ;;; (in the widget) so it is reusable and unit-tested without a screen.
 
-(defun %read-uint (buf off nbytes big-endian)
-  "Assemble NBYTES of BUF at OFF into an unsigned integer, or NIL when fewer than NBYTES
-remain from OFF."
-  (when (<= (+ off nbytes) (length buf))
+(defun %read-uint (v off nbytes big-endian)
+  "Assemble NBYTES of V at OFF into an unsigned integer, or NIL when fewer than NBYTES
+remain from OFF.  Reads through %BREF (works for a paged file source too)."
+  (when (<= (+ off nbytes) (hexv-length v))
     (let ((val 0))
       (dotimes (k nbytes val)
         (let ((idx (if big-endian (+ off k) (+ off (- nbytes 1 k)))))
-          (setf val (logior (ash val 8) (aref buf idx))))))))
+          (setf val (logior (ash val 8) (%bref v idx))))))))
 
 (defun %to-signed (u nbits)
   "Reinterpret unsigned U (or NIL) as an NBITS two's-complement signed integer."
   (if (and u (logbitp (1- nbits) u)) (- u (ash 1 nbits)) u))
 
-(defun %read-f32 (buf off big-endian)
-  (let ((u (%read-uint buf off 4 big-endian)))
+(defun %read-f32 (v off big-endian)
+  (let ((u (%read-uint v off 4 big-endian)))
     (when u (ignore-errors (sb-kernel:make-single-float (%to-signed u 32))))))
 
-(defun %read-f64 (buf off big-endian)
-  (let ((u (%read-uint buf off 8 big-endian)))
+(defun %read-f64 (v off big-endian)
+  (let ((u (%read-uint v off 8 big-endian)))
     (when u (ignore-errors
              (sb-kernel:make-double-float (%to-signed (ash u -32) 32) (logand u #xFFFFFFFF))))))
 
@@ -411,8 +492,8 @@ remain from OFF."
   "Decode the bytes at the cursor as an alist of (LABEL . STRING): u8/i8/u16/i16/u32/i32/
 u64/i64 and f32/f64, in the view's current byte order.  A type whose bytes run past the
 buffer end shows as \"—\"."
-  (let* ((buf (hexv-bytes v)) (off (hexv-cursor v)) (be (hexv-big-endian v)))
-    (flet ((u (n) (%read-uint buf off n be))
+  (let ((off (hexv-cursor v)) (be (hexv-big-endian v)))
+    (flet ((u (n) (%read-uint v off n be))
            (fmt (x) (if x (princ-to-string x) "—"))
            (fmtf (x) (cond ((null x) "—")
                            ((> (abs x) 1d16) (format nil "~,4E" x))
@@ -421,8 +502,8 @@ buffer end shows as \"—\"."
             (cons "u16" (fmt (u 2)))            (cons "i16" (fmt (%to-signed (u 2) 16)))
             (cons "u32" (fmt (u 4)))            (cons "i32" (fmt (%to-signed (u 4) 32)))
             (cons "u64" (fmt (u 8)))            (cons "i64" (fmt (%to-signed (u 8) 64)))
-            (cons "f32" (fmtf (%read-f32 buf off be)))
-            (cons "f64" (fmtf (%read-f64 buf off be)))))))
+            (cons "f32" (fmtf (%read-f32 v off be)))
+            (cons "f64" (fmtf (%read-f64 v off be)))))))
 
 (defun hexv-inspect-lines (v)
   "Two compact inspector lines (unsigned+f32 on top, signed+f64 below), prefixed LE/BE."
@@ -449,6 +530,11 @@ buffer end shows as \"—\"."
   (let ((a (hexv-anchor v)))
     (when a (cons (min a (hexv-cursor v)) (max a (hexv-cursor v))))))
 
+(defun %subbytes (v start end)
+  "A fresh octet vector of V's bytes [START, END), read through %BREF."
+  (let ((out (make-array (- end start) :element-type '(unsigned-byte 8))))
+    (dotimes (k (- end start) out) (setf (aref out k) (%bref v (+ start k))))))
+
 (defun %sel-anchor (v shift)
   "Before a move: extend the selection when SHIFT is held (setting the anchor on the first
 extend), or collapse it otherwise."
@@ -460,15 +546,16 @@ extend), or collapse it otherwise."
   "Copy the selected bytes to the shared clipboard."
   (let ((sel (hexv-selection v)))
     (when sel
-      (setf *clipboard* (subseq (hexv-bytes v) (car sel) (1+ (cdr sel)))
+      (setf *clipboard* (%subbytes v (car sel) (1+ (cdr sel)))
             (hexv-message v) (format nil "copied ~D byte~:P" (length *clipboard*)))
       (invalidate v))))
 
 (defun hex-cut (v)
   "Copy the selection to the clipboard and delete it (one undo step)."
+  (when (%readonly-blocked v) (return-from hex-cut))
   (let ((sel (hexv-selection v)))
     (when sel
-      (setf *clipboard* (subseq (hexv-bytes v) (car sel) (1+ (cdr sel))))
+      (setf *clipboard* (%subbytes v (car sel) (1+ (cdr sel))))
       (%as-one-edit (v) (loop repeat (1+ (- (cdr sel) (car sel))) do (%delete-byte v (car sel))))
       (setf (hexv-anchor v) nil (hexv-message v) (format nil "cut ~D byte~:P" (length *clipboard*)))
       (%goto v (car sel))
@@ -477,6 +564,7 @@ extend), or collapse it otherwise."
 (defun hex-paste (v)
   "Paste the clipboard at the cursor: insert (insert mode) or overwrite up to the buffer
 end (overwrite mode).  One undo step."
+  (when (%readonly-blocked v) (return-from hex-paste))
   (when (plusp (length *clipboard*))
     (let ((clip *clipboard*) (off (hexv-cursor v)))
       (if (eq (hexv-mode v) :insert)
@@ -502,7 +590,7 @@ insert extra / delete surplus)."
   (%as-one-edit (v)
     (let ((count 0) (m (length pattern)) (r (length replacement)))
       (loop with off = 0
-            for hit = (%find-bytes (hexv-bytes v) pattern off)
+            for hit = (%find-bytes v pattern off)
             while hit
             do (%replace-range v hit m replacement) (incf count) (setf off (+ hit r))
             finally (return count)))))
@@ -510,6 +598,7 @@ insert extra / delete surplus)."
 (defun hex-prompt-replace (v)
   "Prompt for a search pattern and a replacement, replace all occurrences, and report the
 count.  An empty replacement deletes the matches."
+  (when (%readonly-blocked v) (return-from hex-prompt-replace))
   (let ((s (prompt-string " Replace " "Find (hex bytes or /text):")))
     (when (and s (plusp (length (string-trim " " s))))
       (let ((pat (%parse-search s)))
@@ -537,8 +626,9 @@ count.  An empty replacement deletes the matches."
   (invalidate v))
 
 (defmethod frame-indicator ((v hex-view))
-  (format nil " ~(~a~) ~:[ovr~;ins~] 0x~X/0x~X~:[~; *~] "
-          (hexv-pane v) (eq (hexv-mode v) :insert)
+  (format nil " ~(~a~) ~a 0x~X/0x~X~:[~; *~] "
+          (hexv-pane v)
+          (cond ((hexv-readonly v) "ro") ((eq (hexv-mode v) :insert) "ins") (t "ovr"))
           (hexv-cursor v) (hexv-length v) (hexv-modified v)))
 
 ;;; --- drawing ----------------------------------------------------------------
@@ -565,7 +655,7 @@ byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
           (dotimes (i bpr)
             (let ((off (+ base i)))
               (when (< off n)
-                (let ((byte (aref (hexv-bytes v) off)))
+                (let ((byte (%bref v off)))
                   (draw-text v (%hex-col i) r (format nil "~2,'0X" byte) (%cell-attr v off :hex sel))
                   (draw-text v (%ascii-col bpr i) r
                              (string (if (<= 32 byte 126) (code-char byte) #\.))
@@ -593,13 +683,10 @@ byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
   (and (characterp ks) (char-equal ks ch) (logtest mods +md-ctrl+)))
 
 (defun %hx-save-report (v)
-  "Save V and record the outcome (bytes written, or the failure) as its status note."
-  (multiple-value-bind (path err) (hex-save v)
-    (setf (hexv-message v)
-          (cond (path (format nil "saved ~D byte~:P to ~A" (hexv-length v) (file-namestring path)))
-                (err  (format nil "save failed: ~A" err))
-                (t    "no file — nothing to save")))
-    (invalidate v)))
+  "Ctrl-S: save in place, or prompt for a name (Save-As) when the buffer is unnamed."
+  (cond ((hexv-readonly v) (setf (hexv-message v) "read-only — large file") (invalidate v))
+        ((hexv-filename v) (multiple-value-call #'%hx-say-saved v (hex-save v)) (invalidate v))
+        (t (hex-prompt-save-as v))))
 
 (defmethod handle-event ((v hex-view) (e key-event))
   (let* ((ks (event-keysym e)) (mods (event-modifiers e)) (shift (logtest mods +md-shift+)))
@@ -614,6 +701,7 @@ byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
       ((eql ks :end)   (%sel-anchor v shift) (%goto v (%max-cursor v))  (setf (handled-p e) t))
       ((eql ks :ins)   (hex-toggle-mode v)              (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\s) (%hx-save-report v)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\w) (hex-prompt-save-as v) (setf (handled-p e) t))  ; write-as
       ((%ctrl-char-p ks mods #\z) (hex-undo v)          (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\y) (hex-redo v)          (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\g) (hex-prompt-goto v)   (setf (handled-p e) t))
@@ -669,4 +757,5 @@ byte (SEL is the (LO . HI) range or NIL), an edited-but-unsaved byte, or plain."
     ("Ctrl+G"       . "go to a hex offset")
     ("Ctrl+E"       . "toggle the data inspector's byte order (LE/BE)")
     ("Ctrl+Z / Ctrl+Y" . "undo / redo")
-    ("Ctrl+S"       . "save to the file")))
+    ("Ctrl+S"       . "save (prompts for a name when the buffer is new)")
+    ("Ctrl+W"       . "save as… (choose a new file)")))

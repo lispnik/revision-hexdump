@@ -25,6 +25,7 @@
    ;; buffer logic (usable on its own, no screen needed)
    #:hex-load
    #:hex-save
+   #:hex-prompt-save-as
    #:hex-undo
    #:hex-redo
    #:hex-search
@@ -34,6 +35,8 @@
    #:hex-toggle-endian
    #:hexv-big-endian
    #:hexv-bpr
+   #:hexv-readonly
+   #:*max-in-memory*
    #:hexv-selection
    #:hex-copy
    #:hex-cut

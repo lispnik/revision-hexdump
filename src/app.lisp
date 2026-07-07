@@ -32,8 +32,10 @@ Tab toggles the hex/ASCII pane, and it reports unsaved edits so the desktop guar
               (or (and (hexv-message v) (format nil " ~A " (hexv-message v)))   ; transient note takes priority
                   (and sel (format nil " ~D bytes selected · Ctrl-C: copy · Ctrl-X: cut · Ctrl-V: paste · Esc: close "
                                    (1+ (- (cdr sel) (car sel)))))
-                  (format nil " ~:[HEX~;ASCII~]/~:[OVR~;INS~] · 0x~X of 0x~X · Ins: mode · Ctrl-F: find · Ctrl-R: replace · Ctrl-G: goto · Ctrl-Z: undo · Ctrl-S: save "
-                          (eq (hexv-pane v) :ascii) (eq (hexv-mode v) :insert) (hexv-cursor v) (hexv-length v))))))))
+                  (format nil " ~:[HEX~;ASCII~]/~A · 0x~X of 0x~X · Ins: mode · Ctrl-F: find · Ctrl-R: replace · Ctrl-G: goto · Ctrl-Z: undo · Ctrl-S: save "
+                          (eq (hexv-pane v) :ascii)
+                          (cond ((hexv-readonly v) "RO") ((eq (hexv-mode v) :insert) "INS") (t "OVR"))
+                          (hexv-cursor v) (hexv-length v))))))))
 
 (defun %hx-inspect (w)
   "Refresh the two data-inspector lines from the cursor."
@@ -85,8 +87,11 @@ is loaded eagerly)."
     (add-laid body st 1)
     (add-subview win body)
     (setf (window-scroll-target win) hv (window-help win) :hexdump)
-    (when (and path (probe-file path)) (hex-load hv path))
-    (values win hv (lambda (s) (declare (ignore s)) nil))))
+    (if (and path (probe-file path))
+        (hex-load hv path)
+        (setf (hexv-mode hv) :insert))              ; a new, empty buffer starts ready to type
+    ;; OPEN returns a cleanup thunk: close any paged file source when the window closes.
+    (values win hv (lambda (s) (declare (ignore s)) (lambda () (%close-source hv))))))
 
 (defun run-hexdump (&optional path)
   "Run a hex editor full-screen for PATH (or an empty buffer) until it quits."

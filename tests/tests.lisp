@@ -155,6 +155,29 @@
         (fiveam:is (= #xFF (aref b 0)))
         (fiveam:is (= (char-code #\Z) (aref b 1)))))))
 
+;;; --- new file / save-as -----------------------------------------------------
+
+(fiveam:test new-buffer-is-insert-mode
+  (multiple-value-bind (win focus) (make-hexdump)   ; no path -> empty buffer
+    (declare (ignore win))
+    (fiveam:is (zerop (hexv-length focus)) "a new buffer is empty")
+    (fiveam:is (eq :insert (hexv-mode focus)) "and opens in insert mode, ready to type")))
+
+(fiveam:test opened-file-stays-overwrite
+  (with-temp-file (p (%buf '(1 2 3)))
+    (multiple-value-bind (win focus) (make-hexdump p)
+      (declare (ignore win))
+      (fiveam:is (eq :overwrite (hexv-mode focus)) "opening an existing file stays in overwrite mode"))))
+
+(fiveam:test author-and-save-new-file
+  (with-temp-file (p (%buf #()))                    ; an empty destination path
+    (let ((v (%view)))
+      (setf (hexv-mode v) :insert)
+      (%ascii-input v #\N) (%ascii-input v #\O)      ; author two bytes
+      (hex-save v p)                                 ; save-as (explicit path) reuses hex-save
+      (fiveam:is (equalp #(78 79) (coerce (read-file-bytes p) 'vector)) "authored bytes are written to the chosen path")
+      (fiveam:is-false (hexv-modified v) "saving a new file marks it clean"))))
+
 ;;; --- widget / window integration --------------------------------------------
 
 (fiveam:test key-hints
@@ -376,9 +399,29 @@
 
 (fiveam:test inspector-floats
   (let ((v (%view #(#x00 #x00 #x80 #x3F))))            ; IEEE-754 single 1.0, little-endian
-    (fiveam:is (= 1.0f0 (%read-f32 (hexv-bytes v) 0 nil)) "decodes a float32"))
+    (fiveam:is (= 1.0f0 (%read-f32 v 0 nil)) "decodes a float32"))
   (let ((v (%view #(#x00 #x00 #x00 #x00 #x00 #x00 #xF0 #x3F))))  ; double 1.0, little-endian
-    (fiveam:is (= 1.0d0 (%read-f64 (hexv-bytes v) 0 nil)) "decodes a float64")))
+    (fiveam:is (= 1.0d0 (%read-f64 v 0 nil)) "decodes a float64")))
+
+;;; --- large-file (paged, read-only) source -----------------------------------
+
+(fiveam:test large-file-readonly
+  (with-temp-file (p (%buf (loop for i below 20 collect i)))
+    (let ((v (%view)) (*max-in-memory* 4) (*fs-page-size* 8))   ; force the paged path, tiny pages
+      (hex-load v p)
+      (fiveam:is-true (hexv-readonly v) "a file over the threshold opens read-only")
+      (fiveam:is (= 20 (hexv-length v)) "its length is known without loading it")
+      (fiveam:is (= 5 (%bref v 5)) "a paged read returns the right byte")
+      (fiveam:is (= 19 (%bref v 19)) "including across page boundaries")
+      (%set-byte v 0 #xFF)                              ; editing is refused
+      (fiveam:is (= 0 (%bref v 0)) "a read-only source cannot be edited")
+      (fiveam:is-false (hexv-modified v))
+      (fiveam:is (= 10 (hex-search v (%buf '(10 11 12)) 0)) "search scans a paged source")
+      (%goto v 0)                                        ; search left the cursor at the match
+      (let ((a (hexv-inspect v)))
+        (fiveam:is (string= "0" (cdr (assoc "u8" a :test #'string=))) "the inspector reads a paged source"))
+      (%close-source v)
+      (fiveam:is-false (hexv-source v) "close releases the source"))))
 
 ;;; --- go-to-offset parsing ---------------------------------------------------
 

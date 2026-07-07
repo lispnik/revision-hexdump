@@ -37,7 +37,8 @@ classic hex-editor default).
 | `Ctrl+G` | go to a hex offset (`1F` or `0x1F`) |
 | `Ctrl+E` | toggle the data inspector's byte order (LE / BE) |
 | `Ctrl+Z` `Ctrl+Y` | undo / redo |
-| `Ctrl+S` | save to the file |
+| `Ctrl+S` | save (prompts for a name when the buffer is new) |
+| `Ctrl+W` | save as… (choose a new file) |
 | mouse click | move the cursor to a byte / pick a pane |
 | wheel | scroll |
 
@@ -61,6 +62,16 @@ A **data inspector** under the dump decodes the bytes at the cursor as `u8`/`i8`
 `u64`/`i64` and `f32`/`f64`, in little- or big-endian (`Ctrl+E` toggles). The dump
 **adapts its width** to the window: a wider window shows 24 or 32 bytes per row (always a
 multiple of 8), a narrow one drops to 8.
+
+**New files & Save-As.** Opening with no path (`run-hexdump`) gives an empty buffer in
+insert mode; type, then `Ctrl+S` prompts for a name (via the framework's `:save` file
+dialog, which confirms overwrites). `Ctrl+W` is Save-As for an existing buffer.
+
+**Large files.** A file over `*max-in-memory*` (default 64 MB) is **not loaded into RAM** —
+it opens **read-only**, read one page at a time on demand through a bounded cache, so a
+multi-GB file can be viewed, navigated, searched, and inspected without OOM. (In-place
+*editing* of huge files would need a piece table and is out of scope; small files stay
+fully editable.)
 
 ## As a desktop window
 
