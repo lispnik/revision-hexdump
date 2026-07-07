@@ -538,6 +538,32 @@
     (fiveam:is (and (string= "pair.x" (tf-path (fourth fs))) (= 3 (tf-offset (fourth fs))) (= 40 (tf-value (fourth fs)))))
     (fiveam:is (and (string= "pair.y" (tf-path (fifth fs))) (= 4 (tf-offset (fifth fs))) (= 50 (tf-value (fifth fs)))))))
 
+(fiveam:test template-dynamic-length
+  ;; a string whose length comes from a prior field
+  (let* ((bytes (concatenate 'vector #(3) (map 'vector #'char-code "abcXX")))
+         (fs (parse-template '((n :u8) (s (:string n))) (%ref-of bytes) (length bytes) 0)))
+    (destructuring-bind (n s) fs
+      (fiveam:is (= 3 (tf-value n)))
+      (fiveam:is (string= "abc" (tf-value s)) "string length taken from field N")
+      (fiveam:is (= 3 (tf-size s)))))
+  ;; an array whose count comes from a prior field
+  (let* ((bytes #(2 #x0A #x00 #x0B #x00 #xFF))
+         (fs (parse-template '((cnt :u8) (arr (:array :u16 cnt))) (%ref-of bytes) (length bytes) 0)))
+    (fiveam:is (= 3 (length fs)) "cnt + 2 array elements")
+    (fiveam:is (= #x000A (tf-value (second fs))) "arr[0]")
+    (fiveam:is (= #x000B (tf-value (third fs))) "arr[1]")))
+
+(fiveam:test template-enum-and-flags
+  (let ((fs (parse-template '((k :u8 :enum ((0 . "none") (1 . "file") (2 . "dir"))))
+                            (%ref-of #(1)) 1 0)))
+    (fiveam:is (string= "file" (tf-note (first fs))) "enum maps the value to a name")
+    (fiveam:is (search "[file]" (%tf-str (first fs))) "and it shows in the field string"))
+  (let ((fs (parse-template '((f :u8 :flags ((1 . "a") (2 . "b") (4 . "c"))))
+                            (%ref-of #(5)) 1 0)))          ; 0b101 = a|c
+    (fiveam:is (string= "a|c" (tf-note (first fs))) "flags join the set bits' names"))
+  (let ((fs (parse-template '((k :u8 :enum ((9 . "nine")))) (%ref-of #(3)) 1 0)))
+    (fiveam:is-false (tf-note (first fs)) "an unmatched enum value has no note")))
+
 (fiveam:test template-truncation
   (let ((fs (parse-template '((a :u32)) (%ref-of #(1 2)) 2 0)))   ; only 2 of 4 bytes
     (fiveam:is-false (tf-value (first fs)) "a field running past the end has no value")))

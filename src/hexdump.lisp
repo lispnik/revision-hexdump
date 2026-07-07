@@ -671,7 +671,30 @@ buffer end shows as \"—\"."
 ;;; which annotate the dump (each field's bytes tint; the field at the cursor shows).
 
 (defstruct (tfield (:constructor %tfield) (:conc-name tf-))
-  path type offset size value)
+  path type offset size value note)                     ; NOTE: an enum/flags annotation, or NIL
+
+(defvar *tenv* nil "Field short-name -> value, for resolving dynamic lengths and references.")
+
+(defun %short-name (path)
+  (let ((dot (position #\. path :from-end t))) (if dot (subseq path (1+ dot)) path)))
+
+(defun %resolve-count (count)
+  "A length that is a literal integer, a symbol naming a prior field, or (:ref NAME)."
+  (cond ((integerp count) count)
+        ((symbolp count) (or (and *tenv* (gethash (string-downcase (string count)) *tenv*)) 0))
+        ((and (consp count) (eq (first count) :ref))
+         (or (and *tenv* (gethash (string-downcase (string (second count))) *tenv*)) 0))
+        (t 0)))
+
+(defun %enum-note (value options)
+  "A display note for VALUE from OPTIONS: :enum ((val . name)...) picks a name; :flags
+((bit . name)...) joins the set bits' names; else NIL."
+  (let ((enum (getf options :enum)) (flags (getf options :flags)))
+    (cond (enum (cdr (assoc value enum :test #'eql)))
+          ((and flags (integerp value))
+           (let ((set (loop for (bit . name) in flags when (logtest value bit) collect name)))
+             (when set (format nil "~{~a~^|~}" set))))
+          (t nil))))
 
 (defun %scalar-size (type)
   (case type ((:u8 :i8) 1) ((:u16 :i16) 2) ((:u32 :i32 :f32) 4) ((:u64 :i64 :f64) 8) (t 0)))
@@ -700,45 +723,51 @@ buffer end shows as \"—\"."
     (loop for k below n for idx = (+ offset k) while (< idx len)
           do (format s "~:[~; ~]~2,'0X" (plusp k) (funcall ref idx)))))
 
-(defun %parse-into (path type ref len offset be acc)
-  "Parse field PATH of TYPE at OFFSET; return (values SIZE ACC) with leaf TFIELDs pushed on ACC."
+(defun %parse-into (path type options ref len offset be acc)
+  "Parse field PATH of TYPE (with per-field OPTIONS) at OFFSET; return (values SIZE ACC) with
+leaf TFIELDs pushed on ACC.  Scalar values bind *TENV* so later fields' lengths can refer to
+them; a length may be an integer or a name (see %RESOLVE-COUNT)."
   (cond
     ((keywordp type)
-     (let ((sz (%scalar-size type)))
+     (let* ((sz (%scalar-size type)) (val (%read-scalar ref len offset type be)))
+       (when (and val (member type '(:u8 :i8 :u16 :i16 :u32 :i32 :u64 :i64)))
+         (setf (gethash (%short-name path) *tenv*) val))
        (values sz (cons (%tfield :path path :type type :offset offset :size sz
-                                 :value (%read-scalar ref len offset type be)) acc))))
+                                 :value val :note (%enum-note val options)) acc))))
     ((eq (first type) :bytes)
-     (let ((n (second type)))
+     (let ((n (%resolve-count (second type))))
        (values n (cons (%tfield :path path :type :bytes :offset offset :size n
                                 :value (%read-bytes-field ref len offset n)) acc))))
     ((eq (first type) :string)
-     (let ((n (second type)))
+     (let ((n (%resolve-count (second type))))
        (values n (cons (%tfield :path path :type :string :offset offset :size n
                                 :value (%read-str-field ref len offset n)) acc))))
     ((eq (first type) :array)
      (destructuring-bind (elem n) (rest type)
-       (let ((total 0))
-         (dotimes (i n (values total acc))
-           (multiple-value-bind (sz a) (%parse-into (format nil "~a[~d]" path i) elem ref len (+ offset total) be acc)
+       (let ((count (%resolve-count n)) (total 0))
+         (dotimes (i count (values total acc))
+           (multiple-value-bind (sz a) (%parse-into (format nil "~a[~d]" path i) elem nil ref len (+ offset total) be acc)
              (setf total (+ total sz) acc a))))))
     ((eq (first type) :struct)
      (let ((total 0))
        (dolist (f (rest type) (values total acc))
-         (multiple-value-bind (sz a)
-             (%parse-into (format nil "~a.~(~a~)" path (first f)) (second f) ref len (+ offset total) be acc)
-           (setf total (+ total sz) acc a)))))
+         (destructuring-bind (fname ftype &rest fopts) f
+           (multiple-value-bind (sz a)
+               (%parse-into (format nil "~a.~(~a~)" path fname) ftype fopts ref len (+ offset total) be acc)
+             (setf total (+ total sz) acc a))))))
     (t (values 0 acc))))
 
 (defun parse-template (template ref len offset)
   "Parse TEMPLATE against bytes read via (funcall REF i) over [0,LEN), starting at OFFSET;
-return a flat list of leaf TFIELDs in file order."
-  (let ((be nil) (fields template) (total 0) (acc '()))
+return a flat list of leaf TFIELDs in file order.  A field spec is (NAME TYPE . OPTIONS)."
+  (let ((be nil) (fields template) (total 0) (acc '()) (*tenv* (make-hash-table :test 'equal)))
     (when (and (consp (first template)) (eq (caar template) :endian))
       (setf be (eq (second (first template)) :big) fields (rest template)))
     (dolist (f fields)
-      (multiple-value-bind (sz a)
-          (%parse-into (string-downcase (string (first f))) (second f) ref len (+ offset total) be acc)
-        (setf total (+ total sz) acc a)))
+      (destructuring-bind (name type &rest options) f
+        (multiple-value-bind (sz a)
+            (%parse-into (string-downcase (string name)) type options ref len (+ offset total) be acc)
+          (setf total (+ total sz) acc a))))
     (nreverse acc)))
 
 (defun %tf-type-label (tf)
@@ -749,10 +778,12 @@ return a flat list of leaf TFIELDs in file order."
 
 (defun %tf-value-str (tf)
   (let ((v (tf-value tf)))
-    (cond ((null v) "—")
-          ((eq (tf-type tf) :string) (format nil "~s" v))
-          ((eq (tf-type tf) :bytes) v)
-          (t (princ-to-string v)))))
+    (concatenate 'string
+                 (cond ((null v) "—")
+                       ((eq (tf-type tf) :string) (format nil "~s" v))
+                       ((eq (tf-type tf) :bytes) v)
+                       (t (princ-to-string v)))
+                 (if (tf-note tf) (format nil " [~a]" (tf-note tf)) ""))))
 
 (defun %tf-str (tf)
   (format nil "~A @0x~X (~A) = ~A" (tf-path tf) (tf-offset tf) (%tf-type-label tf) (%tf-value-str tf)))
@@ -770,8 +801,17 @@ return a flat list of leaf TFIELDs in file order."
     ("GIF header"
      (:endian :little)
      (signature (:string 3)) (version (:string 3)) (width :u16) (height :u16)
-     (flags :u8) (bg-color :u8) (aspect :u8)))
-  "Built-in structural templates: (NAME . FIELD-SPECS...).  Applied at the cursor.")
+     (flags :u8 :flags ((#x80 . "gct") (#x08 . "sort"))) (bg-color :u8) (aspect :u8))
+    ("Length-prefixed record"     ; demonstrates dynamic length + enum + flags
+     (:endian :little)
+     (name-len :u8)
+     (name (:string name-len))    ; length comes from the NAME-LEN field
+     (kind  :u8  :enum ((0 . "none") (1 . "file") (2 . "dir")))
+     (flags :u16 :flags ((#x1 . "active") (#x2 . "hidden") (#x4 . "system")))
+     (tag-count :u8)
+     (tags (:array :u16 tag-count))))   ; array length comes from TAG-COUNT
+  "Built-in structural templates: (NAME . FIELD-SPECS...).  Applied at the cursor.  A field
+spec is (NAME TYPE . OPTIONS); a length may name a prior field; :enum / :flags annotate.")
 
 (defun hex-apply-template (v template name)
   "Parse TEMPLATE at the cursor and annotate the dump with its fields."

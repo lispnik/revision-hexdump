@@ -61,12 +61,15 @@ Undo/redo (`Ctrl+Z`/`Ctrl+Y`) covers overwrite, insert, and delete alike, and th
 indicator shows the pane and mode (`hex ins 0x1F/0x2C *`).
 
 **Structural templates** turn the raw dump into a typed view. A template describes a binary
-layout as `(name type)` fields — `(:endian …)`, scalars (`:u8`…`:i64`, `:f32`/`:f64`),
-`(:string N)`, `(:bytes N)`, `(:array elem N)`, and nested `(:struct …)`. `Ctrl+D` applies
-one (a few are built in — BMP / WAV / GIF headers) at the cursor: the field under the cursor
-is highlighted and named in the status line (`field: file-size @0x2 (u32) = 100`), and
-`Ctrl+Q` lists every parsed field to jump between them. (An edit that shifts offsets clears
-the overlay.)
+layout as `(name type . options)` fields — `(:endian …)`, scalars (`:u8`…`:i64`,
+`:f32`/`:f64`), `(:string N)`, `(:bytes N)`, `(:array elem N)`, and nested `(:struct …)`.
+Lengths can be **dynamic** — a `N` may *name a prior field* (`(name (:string name-len))`,
+`(:array :u16 tag-count)`) — and scalars can carry `:enum ((val . name)…)` or
+`:flags ((bit . name)…)` options that annotate the value (`kind = 1 [file]`,
+`flags = 3 [active|hidden]`). `Ctrl+D` applies a template (BMP / WAV / GIF headers and a
+length-prefixed record are built in) at the cursor: the field under the cursor is highlighted
+and named in the status line, and `Ctrl+Q` lists every parsed field to jump between them.
+(An edit that shifts offsets clears the overlay.)
 
 **Shift**+movement extends a byte **selection** (highlighted); `Ctrl+C`/`Ctrl+X`/`Ctrl+V`
 copy / cut / paste it through a shared byte clipboard (paste inserts in insert mode,
