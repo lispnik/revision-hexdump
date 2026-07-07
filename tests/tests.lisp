@@ -410,22 +410,25 @@
   (with-temp-file (p (%buf (loop for i below 20 collect i)))
     (let ((v (%view)) (*max-in-memory* 4) (*fs-page-size* 8))   ; force the paged path, tiny pages
       (hex-load v p)
-      (fiveam:is-false (hexv-readonly v) "a large paged file is editable (not locked)")
-      (fiveam:is-false (hexv-resizable-p v) "but fixed-size — no insert/delete")
+      (fiveam:is-false (hexv-readonly v) "a large paged file is editable")
+      (fiveam:is-true (hexv-resizable-p v) "and resizable via the piece table")
       (fiveam:is (= 20 (hexv-length v)) "its length is known without loading it")
-      (fiveam:is (= 5 (%bref v 5)) "a paged read returns the right byte")
-      (fiveam:is (= 19 (%bref v 19)) "including across page boundaries")
-      ;; overwrite editing goes through the overlay, and undoes
-      (%set-byte v 3 #xFF)
-      (fiveam:is (= #xFF (%bref v 3)) "overwrite edits a paged file through the overlay")
-      (fiveam:is-true (hexv-modified v))
-      (hex-undo v)
-      (fiveam:is (= 3 (%bref v 3)) "undo reverts a paged overwrite")
-      (fiveam:is-false (hexv-modified v))
-      ;; insert is refused (fixed size)
-      (%insert-byte v 0 #x99)
-      (fiveam:is (= 20 (hexv-length v)) "insert is refused on a paged file")
-      (fiveam:is (= 10 (hex-search v (%buf '(10 11 12)) 0)) "search scans a paged source")
+      (fiveam:is (= 19 (%bref v 19)) "a paged read across page boundaries")
+      (%set-byte v 3 #xFF)                                ; overwrite
+      (fiveam:is (= #xFF (%bref v 3)) "overwrite through the piece table")
+      (%insert-byte v 0 #x99)                             ; insert grows it
+      (fiveam:is (= 21 (hexv-length v)) "insert grows a paged file")
+      (fiveam:is (= #x99 (%bref v 0)) "the inserted byte")
+      (fiveam:is (= 0 (%bref v 1)) "and the original bytes shifted right")
+      (fiveam:is (= #xFF (%bref v 4)) "the overwritten byte shifted too")
+      (%delete-byte v 0)                                  ; delete shrinks it back
+      (fiveam:is (= 20 (hexv-length v)))
+      (fiveam:is (= #xFF (%bref v 3)) "and the overwrite is back at offset 3")
+      (hex-undo v) (hex-undo v) (hex-undo v)              ; undo delete, insert, overwrite
+      (fiveam:is (= 3 (%bref v 3)) "undo reverts the whole session")
+      (fiveam:is (= 20 (hexv-length v)))
+      (fiveam:is-false (hexv-modified v) "back to the clean checkpoint")
+      (fiveam:is (= 10 (hex-search v (%buf '(10 11 12)) 0)) "search scans the piece table")
       (%close-source v)
       (fiveam:is-false (hexv-source v) "close releases the source"))))
 
@@ -433,15 +436,19 @@
   (with-temp-file (p (%buf (loop for i below 30 collect i)))
     (let ((v (%view)) (*max-in-memory* 4) (*fs-page-size* 8))
       (hex-load v p)
-      (%set-byte v 0 #xAA) (%set-byte v 15 #xBB) (%set-byte v 29 #xCC)   ; edits across pages
-      (hex-save v)
+      (%set-byte v 0 #xAA)                                ; overwrite byte 0
+      (%insert-byte v 30 #xCC)                            ; append a byte (size grows)
+      (%delete-byte v 5)                                  ; delete byte 5 (size shrinks back)
+      (hex-save v)                                        ; streamed to disk, piece by piece
       (fiveam:is-false (hexv-modified v) "streamed save -> clean")
-      (let ((bytes (read-file-bytes p)))                 ; the file on disk, applied overlay
-        (fiveam:is (= 30 (length bytes)) "size is preserved")
-        (fiveam:is (= #xAA (aref bytes 0)))
-        (fiveam:is (= #xBB (aref bytes 15)) "an edit on a later page is written")
-        (fiveam:is (= #xCC (aref bytes 29)))
-        (fiveam:is (= 7 (aref bytes 7)) "unedited bytes are preserved"))
+      (let ((bytes (read-file-bytes p)))
+        (fiveam:is (= 30 (length bytes)) "one insert + one delete -> net same size")
+        (fiveam:is (= #xAA (aref bytes 0)) "overwrite written")
+        (fiveam:is (= 4 (aref bytes 4)) "byte before the deletion preserved")
+        (fiveam:is (= 6 (aref bytes 5)) "byte 5 deleted; value 6 shifted in")
+        (fiveam:is (= #xCC (aref bytes 29)) "appended byte streamed at the end"))
+      ;; the reopened source now presents the saved file as one piece
+      (fiveam:is (= #xAA (%bref v 0)) "editing continues after save")
       (%close-source v))))
 
 ;;; --- inspector char + binary, and toggles -----------------------------------

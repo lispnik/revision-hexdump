@@ -78,11 +78,11 @@ dialog, which confirms overwrites). `Ctrl+W` is Save-As for an existing buffer.
 
 **Large files.** A file over `*max-in-memory*` (default 64 MB) is **not loaded into RAM** —
 it is read one page at a time on demand through a bounded cache, so a multi-GB file can be
-viewed, navigated, searched, and inspected without OOM. It is also **editable in place**:
-overwrite edits are kept in a sparse overlay and, on save, streamed back to disk (via a
-temp file + rename) — again without loading the whole file. The file keeps its size, so
-**insert/delete are disabled** for a paged file (shifting a multi-GB tail would need a piece
-table); a file loaded in memory has no such limit.
+viewed, navigated, searched, and inspected without OOM. It is also **fully editable** — a
+**piece table** layers edits over the paged source and an append-only add-buffer, so
+overwrite, **insert, and delete all work** (the file's *size* can change) without loading
+it. On save the document is **streamed** out piece by piece (temp file + rename), again
+holding no full copy in memory. Small files load fully; behaviour is identical either way.
 
 ## As a desktop window
 
