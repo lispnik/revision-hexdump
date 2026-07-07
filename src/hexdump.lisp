@@ -9,27 +9,32 @@
 
 (in-package #:revision-hexdump)
 
-(defconstant +bpr+ 16 "Bytes shown per row.")
+(defconstant +bpr+ 16 "Default bytes per row, until LAYOUT sizes the view to its width.")
 
-;;; --- column geometry (pure; the tests pin these) ----------------------------
-;;; A row is:  8-hex OFFSET  ·  16 hex bytes (a wider gap splits the two groups of
-;;; 8)  ·  16 ASCII chars.  Every column is derived from +BPR+ so the three panes
-;;; stay aligned.
+;;; --- column geometry (pure; BPR = bytes per row, chosen from the window width) --
+;;; A row is:  8-hex OFFSET  ·  BPR hex bytes (grouped in 8s by a wider gap)  ·  BPR
+;;; ASCII chars.  Every column is derived from BPR so the three panes stay aligned.
 
 (defun %off-w () 10)                                   ; "XXXXXXXX" + two spaces
 (defun %hex-col (i)                                    ; column of byte I's first hex digit
-  (+ (%off-w) (* i 3) (if (>= i (floor +bpr+ 2)) 1 0)))  ; +1 splits the low/high groups of 8
-(defun %hex-end () (+ (%hex-col (1- +bpr+)) 2))        ; one past the last hex digit
-(defun %ascii-col (i) (+ (%hex-end) 2 i))              ; two-space gap, then the ASCII gutter
-(defun %row-w () (1+ (%ascii-col (1- +bpr+))))         ; total columns a full row occupies
+  (+ (%off-w) (* i 3) (floor i 8)))                    ; +1 extra space after each group of 8
+(defun %hex-end (bpr) (+ (%hex-col (1- bpr)) 2))       ; one past the last hex digit
+(defun %ascii-col (bpr i) (+ (%hex-end bpr) 2 i))      ; two-space gap, then the ASCII gutter
+(defun %row-w (bpr) (1+ (%ascii-col bpr (1- bpr))))    ; columns a full row occupies
 
-(defun %col->byte (col)
+(defun %col->byte (bpr col)
   "Map a view-local COLUMN to the byte it addresses: (values :hex I), (values
 :ascii I), or (values NIL NIL) when the column is in no byte cell."
-  (dotimes (i +bpr+ (values nil nil))
+  (dotimes (i bpr (values nil nil))
     (let ((hc (%hex-col i)))
       (when (<= hc col (1+ hc)) (return (values :hex i)))
-      (when (= col (%ascii-col i)) (return (values :ascii i))))))
+      (when (= col (%ascii-col bpr i)) (return (values :ascii i))))))
+
+(defun %fit-bpr (width)
+  "The largest bytes-per-row (a multiple of 8, at least 8) whose row fits WIDTH columns."
+  (let ((best 8))
+    (loop for b from 16 by 8 to 256 while (<= (%row-w b) width) do (setf best b))
+    best))
 
 ;;; --- the byte buffer --------------------------------------------------------
 
@@ -64,6 +69,10 @@
              :documentation "The active edit pane, :HEX or :ASCII (Tab toggles).")
    (mode     :initform :overwrite :accessor hexv-mode   ; :overwrite | :insert (Ins toggles)
              :documentation "Editing mode: :OVERWRITE keeps the file size; :INSERT lets typing insert bytes and Bksp/Del remove them.")
+   (bpr      :initform +bpr+ :accessor hexv-bpr          ; bytes per row, chosen from the view width by LAYOUT
+             :documentation "Bytes shown per row; LAYOUT sizes it to the view width (a multiple of 8).")
+   (big-endian :initform nil :accessor hexv-big-endian  ; data-inspector byte order (NIL = little-endian)
+             :documentation "Byte order the data inspector decodes with (NIL little-endian; Ctrl-E toggles).")
    (last-search :initform nil :accessor hexv-last-search)  ; the last search pattern (byte vector), for find-next
    (changed  :initform (make-hash-table) :accessor hexv-changed)  ; offset -> T, touched since load/save (highlight)
    (history  :initform (make-array 0 :adjustable t :fill-pointer 0) :accessor hexv-history
@@ -84,10 +93,18 @@ it answers the scroll protocol so a hosting window draws a frame scrollbar."))
 
 (defmethod focusable-p ((v hex-view)) (declare (ignore v)) t)
 
+(defmethod layout ((v hex-view) rect)
+  "Assign bounds and choose bytes-per-row from the available width, then keep the cursor
+in view (a width change moves rows around)."
+  (setf (view-bounds v) rect
+        (hexv-bpr v) (%fit-bpr (rect-width rect)))
+  (setf (hexv-top v) (min (hexv-top v) (scroll-max v)))
+  (%ensure-visible v))
+
 (defun hexv-length (v) (length (hexv-bytes v)))
 (defun %page (v) (max 1 (rect-height (view-bounds v))))
 ;; +1 so a cursor at the append position (offset = length, valid in insert mode) has a row.
-(defun %rows (v) (max 1 (ceiling (1+ (hexv-length v)) +bpr+)))
+(defun %rows (v) (max 1 (ceiling (1+ (hexv-length v)) (hexv-bpr v))))
 (defun %max-cursor (v)
   "The greatest valid cursor offset: LENGTH in insert mode (the append position), else
 LENGTH-1 (overwrite addresses an existing byte)."
@@ -131,7 +148,7 @@ when there is no path.  It never signals -- a failed save must not crash the hos
 
 (defun %ensure-visible (v)
   "Scroll so the cursor's row is on screen."
-  (let ((row (floor (hexv-cursor v) +bpr+)) (page (%page v)))
+  (let ((row (floor (hexv-cursor v) (hexv-bpr v))) (page (%page v)))
     (cond ((< row (hexv-top v)) (setf (hexv-top v) row))
           ((>= row (+ (hexv-top v) page)) (setf (hexv-top v) (1+ (- row page)))))))
 
@@ -338,6 +355,65 @@ search (find-next).  Reports the outcome, and never signals."
         (hexv-nibble v) 0)
   (invalidate v))
 
+;;; --- data inspector ---------------------------------------------------------
+;;; Decode the bytes at the cursor as the common integer and float types, in the
+;;; view's current byte order.  A hosting window shows these; the decoding is here
+;;; (in the widget) so it is reusable and unit-tested without a screen.
+
+(defun %read-uint (buf off nbytes big-endian)
+  "Assemble NBYTES of BUF at OFF into an unsigned integer, or NIL when fewer than NBYTES
+remain from OFF."
+  (when (<= (+ off nbytes) (length buf))
+    (let ((val 0))
+      (dotimes (k nbytes val)
+        (let ((idx (if big-endian (+ off k) (+ off (- nbytes 1 k)))))
+          (setf val (logior (ash val 8) (aref buf idx))))))))
+
+(defun %to-signed (u nbits)
+  "Reinterpret unsigned U (or NIL) as an NBITS two's-complement signed integer."
+  (if (and u (logbitp (1- nbits) u)) (- u (ash 1 nbits)) u))
+
+(defun %read-f32 (buf off big-endian)
+  (let ((u (%read-uint buf off 4 big-endian)))
+    (when u (ignore-errors (sb-kernel:make-single-float (%to-signed u 32))))))
+
+(defun %read-f64 (buf off big-endian)
+  (let ((u (%read-uint buf off 8 big-endian)))
+    (when u (ignore-errors
+             (sb-kernel:make-double-float (%to-signed (ash u -32) 32) (logand u #xFFFFFFFF))))))
+
+(defun hexv-inspect (v)
+  "Decode the bytes at the cursor as an alist of (LABEL . STRING): u8/i8/u16/i16/u32/i32/
+u64/i64 and f32/f64, in the view's current byte order.  A type whose bytes run past the
+buffer end shows as \"—\"."
+  (let* ((buf (hexv-bytes v)) (off (hexv-cursor v)) (be (hexv-big-endian v)))
+    (flet ((u (n) (%read-uint buf off n be))
+           (fmt (x) (if x (princ-to-string x) "—"))
+           (fmtf (x) (cond ((null x) "—")
+                           ((> (abs x) 1d16) (format nil "~,4E" x))
+                           (t (format nil "~,6G" x)))))
+      (list (cons "u8"  (fmt (u 1)))            (cons "i8"  (fmt (%to-signed (u 1) 8)))
+            (cons "u16" (fmt (u 2)))            (cons "i16" (fmt (%to-signed (u 2) 16)))
+            (cons "u32" (fmt (u 4)))            (cons "i32" (fmt (%to-signed (u 4) 32)))
+            (cons "u64" (fmt (u 8)))            (cons "i64" (fmt (%to-signed (u 8) 64)))
+            (cons "f32" (fmtf (%read-f32 buf off be)))
+            (cons "f64" (fmtf (%read-f64 buf off be)))))))
+
+(defun hexv-inspect-lines (v)
+  "Two compact inspector lines (unsigned+f32 on top, signed+f64 below), prefixed LE/BE."
+  (let ((a (hexv-inspect v)) (be (if (hexv-big-endian v) "BE" "LE")))
+    (flet ((g (k) (cdr (assoc k a :test #'string=))))
+      (list
+       (format nil "~a  u8 ~a  u16 ~a  u32 ~a  u64 ~a  f32 ~a"
+               be (g "u8") (g "u16") (g "u32") (g "u64") (g "f32"))
+       (format nil "    i8 ~a  i16 ~a  i32 ~a  i64 ~a  f64 ~a"
+               (g "i8") (g "i16") (g "i32") (g "i64") (g "f64"))))))
+
+(defun hex-toggle-endian (v)
+  "Toggle the data inspector between little- and big-endian."
+  (setf (hexv-big-endian v) (not (hexv-big-endian v)))
+  (invalidate v))
+
 ;;; --- the scroll protocol (a hosting window draws the frame scrollbar) --------
 
 (defmethod scroll-page ((v hex-view)) (%page v))
@@ -365,29 +441,30 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
 
 (defmethod draw ((v hex-view))
   (let* ((b (view-bounds v)) (w (rect-width b)) (h (rect-height b))
-         (ax (rect-ax b)) (ay (rect-ay b))
+         (ax (rect-ax b)) (ay (rect-ay b)) (bpr (hexv-bpr v))
          (n (hexv-length v)) (top (hexv-top v)))
     (dotimes (r h)
       (fill-row v 0 r w (role :normal))
-      (let ((base (* (+ top r) +bpr+)))
+      (let ((base (* (+ top r) bpr)))
         (when (< base (max 1 n))                        ; an empty file still shows its offset row
           (draw-text v 0 r (format nil "~8,'0X" base) (role :label))
-          (dotimes (i +bpr+)
+          (dotimes (i bpr)
             (let ((off (+ base i)))
               (when (< off n)
                 (let ((byte (aref (hexv-bytes v) off)))
                   (draw-text v (%hex-col i) r (format nil "~2,'0X" byte) (%cell-attr v off :hex))
-                  (draw-text v (%ascii-col i) r
+                  (draw-text v (%ascii-col bpr i) r
                              (string (if (<= 32 byte 126) (code-char byte) #\.))
                              (%cell-attr v off :ascii)))))))))
     ;; a real block cursor in the active pane (only when focused); in insert mode it can
     ;; sit at the append position (offset = length), including an empty buffer.
     (when (and (view-focused-p v) *screen* (or (plusp n) (eq (hexv-mode v) :insert)))
-      (let* ((off (hexv-cursor v)) (row (- (floor off +bpr+) top)) (col (mod off +bpr+)))
+      (let* ((bpr (hexv-bpr v)) (off (hexv-cursor v))
+             (row (- (floor off bpr) top)) (col (mod off bpr)))
         (when (<= 0 row (1- h))
           (let ((cx (if (eq (hexv-pane v) :hex)
                         (+ (%hex-col col) (hexv-nibble v))
-                        (%ascii-col col))))
+                        (%ascii-col bpr col))))
             (when (< cx w)
               (set-cursor-pos *screen* (+ ax cx) (+ ay row))
               (set-cursor-shape :block)
@@ -415,10 +492,10 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
     (cond
       ((eql ks :left)  (%move v -1)                     (setf (handled-p e) t))
       ((eql ks :right) (%move v 1)                      (setf (handled-p e) t))
-      ((eql ks :up)    (%move v (- +bpr+))              (setf (handled-p e) t))
-      ((eql ks :down)  (%move v +bpr+)                  (setf (handled-p e) t))
-      ((eql ks :pgup)  (%move v (- (* +bpr+ (%page v)))) (setf (handled-p e) t))
-      ((eql ks :pgdn)  (%move v (* +bpr+ (%page v)))    (setf (handled-p e) t))
+      ((eql ks :up)    (%move v (- (hexv-bpr v)))       (setf (handled-p e) t))
+      ((eql ks :down)  (%move v (hexv-bpr v))           (setf (handled-p e) t))
+      ((eql ks :pgup)  (%move v (- (* (hexv-bpr v) (%page v)))) (setf (handled-p e) t))
+      ((eql ks :pgdn)  (%move v (* (hexv-bpr v) (%page v))) (setf (handled-p e) t))
       ((eql ks :home)  (%goto v 0)                      (setf (handled-p e) t))
       ((eql ks :end)   (%goto v (%max-cursor v))        (setf (handled-p e) t))
       ((eql ks :ins)   (hex-toggle-mode v)              (setf (handled-p e) t))
@@ -427,6 +504,7 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
       ((%ctrl-char-p ks mods #\y) (hex-redo v)          (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\g) (hex-prompt-goto v)   (setf (handled-p e) t))
       ((%ctrl-char-p ks mods #\f) (hex-prompt-find v)   (setf (handled-p e) t))
+      ((%ctrl-char-p ks mods #\e) (hex-toggle-endian v) (setf (handled-p e) t))
       ;; insert mode: Del removes the byte under the cursor, Bksp the one before it
       ((and (eq (hexv-mode v) :insert) (eql ks :del))
        (%delete-byte v (hexv-cursor v))                 (setf (handled-p e) t))
@@ -442,8 +520,8 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
       (t (call-next-method)))))                         ; Tab (pane, at the window), Esc/q bubble
 
 (defmethod handle-event ((v hex-view) (e mouse-down))
-  (let ((base (* (+ (hexv-top v) (mouse-row v e)) +bpr+)))
-    (multiple-value-bind (pane i) (%col->byte (mouse-col v e))
+  (let ((base (* (+ (hexv-top v) (mouse-row v e)) (hexv-bpr v))))
+    (multiple-value-bind (pane i) (%col->byte (hexv-bpr v) (mouse-col v e))
       (when (and pane (< (+ base i) (hexv-length v)))
         (setf (hexv-pane v) pane (hexv-cursor v) (+ base i) (hexv-nibble v) 0)
         (invalidate v))))
@@ -457,7 +535,7 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
 (defmethod view-key-hints ((v hex-view))
   (declare (ignore v))
   '(("Left / Right" . "move one byte")
-    ("Up / Down"    . "move one row (16 bytes)")
+    ("Up / Down"    . "move one row")
     ("PgUp / PgDn"  . "page up / down")
     ("Home / End"   . "start / end of file")
     ("Tab"          . "switch the hex / ASCII pane")
@@ -467,5 +545,6 @@ highlighted, an edited-but-unsaved byte is flagged, otherwise normal."
     ("Bksp / Del"   . "delete a byte (insert mode)")
     ("Ctrl+F"       . "find hex bytes or /text (empty = find next)")
     ("Ctrl+G"       . "go to a hex offset")
+    ("Ctrl+E"       . "toggle the data inspector's byte order (LE/BE)")
     ("Ctrl+Z / Ctrl+Y" . "undo / redo")
     ("Ctrl+S"       . "save to the file")))

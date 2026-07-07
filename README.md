@@ -32,6 +32,7 @@ classic hex-editor default).
 | `Bksp` `Del` | delete a byte (insert mode) |
 | `Ctrl+F` | find — hex bytes (`deadbeef`) or `/text`; empty repeats (find-next) |
 | `Ctrl+G` | go to a hex offset (`1F` or `0x1F`) |
+| `Ctrl+E` | toggle the data inspector's byte order (LE / BE) |
 | `Ctrl+Z` `Ctrl+Y` | undo / redo |
 | `Ctrl+S` | save to the file |
 | mouse click | move the cursor to a byte / pick a pane |
@@ -46,6 +47,11 @@ the cursor. **Insert** mode (toggle with `Insert`) lets typing *insert* new byte
 `Bksp`/`Del` *remove* them, so you can change the file's length or fill an empty file.
 Undo/redo (`Ctrl+Z`/`Ctrl+Y`) covers overwrite, insert, and delete alike, and the frame
 indicator shows the pane and mode (`hex ins 0x1F/0x2C *`).
+
+A **data inspector** under the dump decodes the bytes at the cursor as `u8`/`i8` …
+`u64`/`i64` and `f32`/`f64`, in little- or big-endian (`Ctrl+E` toggles). The dump
+**adapts its width** to the window: a wider window shows 24 or 32 bytes per row (always a
+multiple of 8), a narrow one drops to 8.
 
 ## As a desktop window
 

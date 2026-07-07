@@ -44,15 +44,23 @@
 
 (fiveam:test geometry
   (fiveam:is (< (%hex-col 0) (%hex-col 15)) "hex columns increase left-to-right")
-  (fiveam:is (< (%hex-end) (%ascii-col 0)) "the ASCII gutter is right of the hex pane")
-  (fiveam:is (<= (%row-w) 78) "a full row fits an 80-column window interior")
-  (fiveam:is (= 4 (- (%hex-col 8) (%hex-col 7))) "a wider gap (3+1) splits the two groups of 8 bytes"))
+  (fiveam:is (< (%hex-end 16) (%ascii-col 16 0)) "the ASCII gutter is right of the hex pane")
+  (fiveam:is (<= (%row-w 16) 78) "a full 16-byte row fits an 80-column window interior")
+  (fiveam:is (= 4 (- (%hex-col 8) (%hex-col 7))) "a wider gap (3+1) splits the groups of 8 bytes"))
 
 (fiveam:test col->byte-roundtrips
-  (dotimes (i +bpr+)
-    (fiveam:is (equal (list :hex i)   (multiple-value-list (%col->byte (%hex-col i)))))
-    (fiveam:is (equal (list :ascii i) (multiple-value-list (%col->byte (%ascii-col i))))))
-  (fiveam:is-false (%col->byte 0) "a column in the offset field addresses no byte"))
+  (dotimes (i 16)
+    (fiveam:is (equal (list :hex i)   (multiple-value-list (%col->byte 16 (%hex-col i)))))
+    (fiveam:is (equal (list :ascii i) (multiple-value-list (%col->byte 16 (%ascii-col 16 i))))))
+  (fiveam:is-false (%col->byte 16 0) "a column in the offset field addresses no byte"))
+
+(fiveam:test adaptive-width
+  (fiveam:is (= 16 (%fit-bpr 78)) "16 bytes/row fits an 80-column window interior")
+  (fiveam:is (= 8  (%fit-bpr 40)) "a narrow window drops to 8 bytes/row")
+  (fiveam:is (<= 32 (%fit-bpr 200)) "a wide window shows more per row")
+  (let ((v (%view (%range 100))))
+    (layout v (rect 0 0 140 20))
+    (fiveam:is (= (%fit-bpr 140) (hexv-bpr v)) "layout sizes bytes-per-row to the view width")))
 
 ;;; --- file I/O ---------------------------------------------------------------
 
@@ -109,7 +117,7 @@
     (%move v -100) (fiveam:is (= 0 (hexv-cursor v)) "clamped at the start")
     (%move v 1000) (fiveam:is (= 39 (hexv-cursor v)) "clamped at the end")
     (%goto v 16)   (fiveam:is (= 16 (hexv-cursor v)))
-    (%move v +bpr+) (fiveam:is (= 32 (hexv-cursor v)) "down one row = +16 bytes")))
+    (%move v (hexv-bpr v)) (fiveam:is (= 32 (hexv-cursor v)) "down one row = +bpr bytes")))
 
 (fiveam:test ensure-visible-scrolls
   (let ((v (%view (%range 4000))))                      ; ~250 rows, a 20-row page
@@ -287,6 +295,31 @@
     (fiveam:is (= 12 (hex-search v (%parse-search "/the"))) "find-next continues past the cursor")
     (fiveam:is (= 0 (hex-search v (%parse-search "/the"))) "wraps around to the first match")
     (fiveam:is-false (hex-search v (%parse-search "/zzz") 0) "reports no match")))
+
+;;; --- data inspector ---------------------------------------------------------
+
+(fiveam:test data-inspector
+  (let ((v (%view #(#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08))))
+    (flet ((g (k) (cdr (assoc k (hexv-inspect v) :test #'string=))))
+      (fiveam:is (string= "1" (g "u8")))
+      (fiveam:is (string= "513" (g "u16")) "0x0201 little-endian = 513")
+      (fiveam:is (string= "67305985" (g "u32")) "0x04030201 little-endian")
+      (hex-toggle-endian v)                             ; -> big-endian
+      (fiveam:is (string= "258" (g "u16")) "0x0102 big-endian = 258")
+      (fiveam:is (string= "16909060" (g "u32")) "0x01020304 big-endian"))))
+
+(fiveam:test inspector-signed-and-short
+  (let ((v (%view #(#xFF))))
+    (flet ((g (k) (cdr (assoc k (hexv-inspect v) :test #'string=))))
+      (fiveam:is (string= "255" (g "u8")))
+      (fiveam:is (string= "-1"  (g "i8")) "0xFF as signed = -1")
+      (fiveam:is (string= "—"   (g "u16")) "a type needing more bytes than remain shows —"))))
+
+(fiveam:test inspector-floats
+  (let ((v (%view #(#x00 #x00 #x80 #x3F))))            ; IEEE-754 single 1.0, little-endian
+    (fiveam:is (= 1.0f0 (%read-f32 (hexv-bytes v) 0 nil)) "decodes a float32"))
+  (let ((v (%view #(#x00 #x00 #x00 #x00 #x00 #x00 #xF0 #x3F))))  ; double 1.0, little-endian
+    (fiveam:is (= 1.0d0 (%read-f64 (hexv-bytes v) 0 nil)) "decodes a float64")))
 
 ;;; --- go-to-offset parsing ---------------------------------------------------
 

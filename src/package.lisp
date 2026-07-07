@@ -30,6 +30,10 @@
    #:hex-search
    #:hex-toggle-mode
    #:hexv-mode
+   #:hexv-inspect
+   #:hex-toggle-endian
+   #:hexv-big-endian
+   #:hexv-bpr
    #:read-file-bytes
    #:write-file-bytes
    #:hexv-bytes
