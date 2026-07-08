@@ -708,6 +708,10 @@ buffer end shows as \"—\"."
     (flet ((u (n) (%read-uint v off n be))
            (fmt (x) (if x (princ-to-string x) "—"))
            (fmtf (x) (cond ((null x) "—")
+                           ;; a NaN comparison would signal FLOATING-POINT-INVALID-OPERATION,
+                           ;; so catch the non-finite cases before any arithmetic on X
+                           ((sb-ext:float-nan-p x) "NaN")
+                           ((sb-ext:float-infinity-p x) (if (minusp x) "-Inf" "+Inf"))
                            ((> (abs x) 1d16) (format nil "~,4E" x))
                            (t (format nil "~,6G" x)))))
       (let ((b8 (u 1)))
@@ -885,6 +889,8 @@ add them to *TEMPLATES* (replacing same-named ones).  Returns the count loaded, 
                  (cond ((null v) "—")
                        ((eq (tf-type tf) :string) (format nil "~s" v))
                        ((eq (tf-type tf) :bytes) v)
+                       ((and (floatp v) (sb-ext:float-nan-p v)) "NaN")
+                       ((and (floatp v) (sb-ext:float-infinity-p v)) (if (minusp v) "-Inf" "+Inf"))
                        (t (princ-to-string v)))
                  (if (tf-note tf) (format nil " [~a]" (tf-note tf)) ""))))
 

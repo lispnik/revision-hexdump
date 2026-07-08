@@ -508,6 +508,30 @@
     (%goto v 30) (hex-toggle-mark v)                     ; clear the mark at 30
     (fiveam:is (= 2 (hash-table-count (hexv-marks v))) "toggling clears a mark")))
 
+;;; --- float decoding: NaN / infinity must not signal a float trap ------------
+
+(fiveam:test inspector-nan-infinity
+  ;; 0xFF-filled bytes decode (f32 and f64) to a NaN; the inspector's magnitude
+  ;; test used to compare against it and signal FLOATING-POINT-INVALID-OPERATION.
+  (let ((v (%view #(#xFF #xFF #xFF #xFF #xFF #xFF #xFF #xFF))))
+    (%goto v 0)
+    (let ((a (hexv-inspect v)))                          ; must not error
+      (fiveam:is (string= "NaN" (cdr (assoc "f32" a :test #'string=))) "f32 NaN shown, no trap")
+      (fiveam:is (string= "NaN" (cdr (assoc "f64" a :test #'string=))) "f64 NaN shown, no trap"))
+    (fiveam:is (= 2 (length (hexv-inspect-lines v))) "the inspector lines render"))
+  ;; 0x7F800000 (LE) is +infinity as f32
+  (let ((v (%view #(#x00 #x00 #x80 #x7F))))
+    (%goto v 0)
+    (fiveam:is (string= "+Inf" (cdr (assoc "f32" (hexv-inspect v) :test #'string=))) "infinity shown"))
+  ;; 0xFF800000 (LE bytes 00 00 80 FF) is -infinity as f32
+  (let ((v (%view #(#x00 #x00 #x80 #xFF))))
+    (%goto v 0)
+    (fiveam:is (string= "-Inf" (cdr (assoc "f32" (hexv-inspect v) :test #'string=))) "negative infinity shown")))
+
+(fiveam:test template-float-nan
+  (let ((fs (parse-template '((f :f32)) (%ref-of #(#xFF #xFF #xFF #xFF)) 4 0)))
+    (fiveam:is (search "NaN" (%tf-str (first fs))) "a template f32 NaN renders cleanly, no trap")))
+
 ;;; --- structural templates ---------------------------------------------------
 
 (defun %ref-of (seq) (lambda (i) (elt seq i)))          ; a byte reader over a literal sequence
