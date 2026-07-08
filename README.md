@@ -6,7 +6,7 @@ text-mode UI framework. It renders a file as the classic three-column hexdump â€
 cursor, type hex digits or ASCII, and save. It doubles as a worked example of
 authoring a custom **scrollable, editable widget** on revision's public API.
 
-![the hex editor touring its features: a BMP shown as offset/hex/ASCII columns with its structural template auto-detected, the parsed field list, the data inspector, in-place editing, and a search](media/demo.gif)
+![the hex editor's structural templates: a PNG opened as offset/hex/ASCII columns with its template auto-detected, the parsed field list (width/height/enum-decoded color-type), and the template picker listing the built-in and user formats (PNG, ELF, ZIP, JPEG, PDF, Mach-O, â€¦)](media/demo.gif)
 
 ```lisp
 (asdf:load-system "revision-hexdump")
