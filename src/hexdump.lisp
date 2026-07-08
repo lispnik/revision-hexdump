@@ -751,6 +751,14 @@ buffer end shows as \"—\"."
 
 (defvar *tenv* nil "Field short-name -> value, for resolving dynamic lengths and references.")
 
+(defparameter *template-max-array* 65536
+  "Cap on a template :ARRAY's element count, so a corrupt or crafted length field read from
+an arbitrary file can't make parsing allocate unboundedly.")
+
+;; forward declaration: DETECT-TEMPLATE / LOAD-TEMPLATES (below) reference *TEMPLATES*
+;; before its full definition (the built-in templates, further down).
+(defvar *templates*)
+
 (defun %short-name (path)
   (let ((dot (position #\. path :from-end t))) (if dot (subseq path (1+ dot)) path)))
 
@@ -820,7 +828,9 @@ them; a length may be an integer or a name (see %RESOLVE-COUNT)."
                                 :value (%read-str-field ref len offset n)) acc))))
     ((eq (first type) :array)
      (destructuring-bind (elem n) (rest type)
-       (let ((count (%resolve-count n)) (total 0))
+       ;; clamp to [0, *template-max-array*]: a negative count (a signed length field) is
+       ;; empty, and a crafted huge one is bounded so parsing can't OOM
+       (let ((count (max 0 (min (%resolve-count n) *template-max-array*))) (total 0))
          (dotimes (i count (values total acc))
            (multiple-value-bind (sz a) (%parse-into (format nil "~a[~d]" path i) elem nil ref len (+ offset total) be acc)
              (setf total (+ total sz) acc a))))))

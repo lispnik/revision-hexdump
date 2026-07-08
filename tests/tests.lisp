@@ -577,6 +577,16 @@
     (fiveam:is (= #x000A (tf-value (second fs))) "arr[0]")
     (fiveam:is (= #x000B (tf-value (third fs))) "arr[1]")))
 
+(fiveam:test template-array-count-bounded
+  ;; a crafted huge array count (here a u32 = ~4 billion) must not hang / OOM
+  (let* ((bytes #(#xFF #xFF #xFF #xFF #x00 #x00))       ; count = 0xFFFFFFFF
+         (*template-max-array* 8)                        ; small cap for the test
+         (fs (parse-template '((n :u32) (arr (:array :u8 n))) (%ref-of bytes) (length bytes) 0)))
+    (fiveam:is (= (1+ *template-max-array*) (length fs)) "the array is clamped to the cap"))
+  ;; a negative count (a signed length field) yields an empty array, not an error
+  (let ((fs (parse-template '((n :i8) (arr (:array :u8 n))) (%ref-of #(#xFF)) 1 0)))
+    (fiveam:is (= 1 (length fs)) "negative count -> just the length field, no array elements")))
+
 (fiveam:test template-enum-and-flags
   (let ((fs (parse-template '((k :u8 :enum ((0 . "none") (1 . "file") (2 . "dir"))))
                             (%ref-of #(1)) 1 0)))
