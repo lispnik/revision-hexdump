@@ -118,7 +118,7 @@ twice.  Checked when the desktop builds its menus.")
 ;; register the builder (for dt-open + layout save/restore) and, unless a host
 ;; opts out, a Tools item that prompts for a file.
 ;; load the user's own templates, if any (plain Lisp data; see LOAD-TEMPLATES)
-(let ((user-file (merge-pathnames ".config/revision-hexdump/templates" (user-homedir-pathname))))
+(let ((user-file (merge-pathnames ".config/revision-hexdump/templates.lisp" (user-homedir-pathname))))
   (when (probe-file user-file) (ignore-errors (load-templates user-file))))
 
 (register-window :hexdump (lambda () (make-hexdump)))

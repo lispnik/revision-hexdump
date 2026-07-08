@@ -76,7 +76,7 @@ and named in the status line, and `Ctrl+Q` lists every parsed field to jump betw
 Templates with a `(:magic …)` option are **auto-detected**: opening a file whose bytes match
 applies the template automatically (the BMP above needs no keypress), and the `Ctrl+D` menu
 has an **(auto-detect)** entry. Your own templates load from disk — put entries (each a
-`("name" …specs…)` form) in `~/.config/revision-hexdump/templates`, or pick **(load file…)** — so
+`("name" …specs…)` form) in `~/.config/revision-hexdump/templates.lisp`, or pick **(load file…)** — so
 you can add formats without touching the source.
 
 **File diff.** `Ctrl+O` compares the file against another (a picker; toggle off with `Ctrl+O`
