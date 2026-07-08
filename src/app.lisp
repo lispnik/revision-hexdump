@@ -97,6 +97,7 @@ is loaded eagerly)."
   (let ((existing (find-if (lambda (w) (typep w 'hex-window)) (dt-windows dt))))
     (cond
       (existing (hex-load (%hx-view existing) path)
+                (hex-detect (%hx-view existing))        ; auto-apply a template by magic, as on a fresh open
                 (dt-raise dt existing) (dt-refocus dt) (invalidate dt))
       (t (dt-open dt (lambda () (make-hexdump path)))
          ;; opened via a builder function -> record the KIND ourselves so the window
@@ -125,3 +126,7 @@ twice.  Checked when the desktop builds its menus.")
       (lambda (dt)
         (when *auto-menu*
           (list "Tools" (list "Hex editor…" (lambda () (prompt-hexdump dt)))))))
+
+;; publish a feature so user config can guard hex-editor code at read time
+;; (e.g. `#+revision-hexdump (pushnew '(...) revision-hexdump:*templates* ...)`).
+(pushnew :revision-hexdump *features*)
